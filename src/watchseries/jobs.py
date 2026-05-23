@@ -62,10 +62,19 @@ class Job:
 
 
 class JobManager:
-    def __init__(self, default_save_path: Path):
+    def __init__(self, default_save_path: Path, store=None):
         self.default_save_path = default_save_path
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
+        self._store = store  # optional JobStore for persistence
+        if store is not None:
+            # Resume: load any persisted jobs, restart workers for ones that
+            # were mid-flight before shutdown.
+            for job in store.load_all():
+                self._jobs[job.hash] = job
+                if job.state in (STATE_QUEUED, STATE_DOWNLOADING):
+                    threading.Thread(target=self._run, args=(job,),
+                                     daemon=True).start()
 
     # ---- public API ----
 
@@ -82,6 +91,11 @@ class JobManager:
     def delete(self, h: str) -> None:
         with self._lock:
             self._jobs.pop(h, None)
+        if self._store is not None:
+            try:
+                self._store.delete(h)
+            except Exception:
+                pass
 
     def add_from_magnet(self, magnet: str, save_path: Path | None,
                         category: str) -> Job | None:
@@ -113,14 +127,24 @@ class JobManager:
             job.season_pack = p.season
         with self._lock:
             self._jobs[h] = job
+        self._persist(job)
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
         return job
+
+    def _persist(self, job: Job) -> None:
+        if self._store is not None:
+            try:
+                self._store.save(job)
+            except Exception:
+                pass  # persistence is best-effort; don't break a download
 
     # ---- worker ----
 
     def _run(self, job: Job) -> None:
         try:
             job.state = STATE_DOWNLOADING
+            job.error = ""
+            self._persist(job)
             job.content_path.mkdir(parents=True, exist_ok=True)
 
             if job.media_type == "movie":
@@ -136,35 +160,44 @@ class JobManager:
             if not job.files:
                 job.state = STATE_ERROR
                 job.error = "no episodes were downloaded"
+                self._persist(job)
                 return
             job.progress = 1.0
             job.state = STATE_FINISHED
+            self._persist(job)
         except Exception as e:
             job.state = STATE_ERROR
             job.error = repr(e)
+            self._persist(job)
 
     def _download_movie(self, job: Job) -> None:
+        dest = job.content_path / f"{safe_name(job.title)}.mp4"
+        if _existing_ok(dest):
+            self._record_file(job, dest)
+            return
         srcs = get_sources("movie", job.tmdb_id, job.title, year=job.year)
         if srcs is None:
             raise RuntimeError("no sources for movie")
         src = pick_source(srcs.sources, job.quality)
         if not src:
             raise RuntimeError("no playable source quality")
-        dest = job.content_path / f"{safe_name(job.title)}.mp4"
         self._run_ffmpeg(job, src.url, dest)
         for s in srcs.subtitles:
             ext = Path(s.url).suffix or ".vtt"
             fetch_subtitle(s.url, dest.with_name(f"{dest.stem}.{s.lang}{ext}"))
 
     def _download_episode(self, job: Job, season: int, episode: int) -> None:
+        season_dir = job.content_path / f"Season {season:02d}"
+        dest = season_dir / f"{safe_name(job.title)} - s{season:02d}e{episode:02d}.mp4"
+        if _existing_ok(dest):
+            self._record_file(job, dest)
+            return
         srcs = get_sources("tv", job.tmdb_id, job.title, season, episode)
         if srcs is None:
             return  # episode missing — skip silently
         src = pick_source(srcs.sources, job.quality)
         if not src:
             return
-        season_dir = job.content_path / f"Season {season:02d}"
-        dest = season_dir / f"{safe_name(job.title)} - s{season:02d}e{episode:02d}.mp4"
         self._run_ffmpeg(job, src.url, dest)
         for s in srcs.subtitles:
             ext = Path(s.url).suffix or ".vtt"
@@ -173,14 +206,18 @@ class JobManager:
     def _download_season(self, job: Job, season: int) -> None:
         ep = 1
         while True:
+            season_dir = job.content_path / f"Season {season:02d}"
+            dest = season_dir / f"{safe_name(job.title)} - s{season:02d}e{ep:02d}.mp4"
+            if _existing_ok(dest):
+                self._record_file(job, dest)
+                ep += 1
+                continue
             srcs = get_sources("tv", job.tmdb_id, job.title, season, ep)
             if srcs is None:
                 break
             src = pick_source(srcs.sources, job.quality)
             if not src:
                 break
-            season_dir = job.content_path / f"Season {season:02d}"
-            dest = season_dir / f"{safe_name(job.title)} - s{season:02d}e{ep:02d}.mp4"
             self._run_ffmpeg(job, src.url, dest)
             for s in srcs.subtitles:
                 ext = Path(s.url).suffix or ".vtt"
@@ -210,12 +247,27 @@ class JobManager:
         ok = ffmpeg_download(m3u8, dest, progress_cb=cb)
         if not ok:
             raise RuntimeError(f"ffmpeg failed for {dest.name}")
+        self._record_file(job, dest)
+
+    def _record_file(self, job: Job, dest: Path) -> None:
+        if dest in job.files:
+            return  # already tracked (resume case)
         job.files.append(dest)
         try:
-            job.size_done += dest.stat().st_size
+            sz = dest.stat().st_size
+            job.size_done += sz
             job.size_total = max(job.size_total, job.size_done)
         except FileNotFoundError:
             pass
+        self._persist(job)
+
+
+def _existing_ok(dest: Path) -> bool:
+    """Treat any file >1MB at the expected path as already-downloaded."""
+    try:
+        return dest.is_file() and dest.stat().st_size > 1_000_000
+    except OSError:
+        return False
 
 
 # ---- magnet helpers ----

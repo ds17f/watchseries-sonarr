@@ -18,6 +18,7 @@ from fastapi import FastAPI
 
 from . import dashboard, fakeqbt, torznab
 from .jobs import JobManager
+from .persistence import JobStore
 from .scraper import check_environment
 
 
@@ -25,7 +26,10 @@ def create_app() -> FastAPI:
     download_dir = Path(os.environ.get("WSG_DOWNLOAD_DIR", "/downloads"))
     download_dir.mkdir(parents=True, exist_ok=True)
 
-    job_manager = JobManager(default_save_path=download_dir)
+    state_dir = Path(os.environ.get("WSG_STATE_DIR", str(download_dir / ".wsg-state")))
+    store = JobStore(state_dir / "jobs.db")
+
+    job_manager = JobManager(default_save_path=download_dir, store=store)
     fakeqbt.configure(job_manager)
 
     app = FastAPI(title="watchseries-grabber",
