@@ -247,12 +247,16 @@ def make_magnet(media_type: str, tmdb_id: str, title: str,
     # Deterministic fake info-hash so Sonarr de-dupes identical requests.
     fake_btih = hashlib.sha1(payload.encode()).hexdigest()
     dn = _release_name_for(media_type, title, season, episode, quality)
-    qs = urllib.parse.urlencode({
-        "xt": f"urn:btih:{fake_btih}",
-        "dn": dn,
-        "xs": payload,
-    })
-    return f"magnet:?{qs}"
+    # Build magnet manually: MonoTorrent (used by Prowlarr) rejects magnets
+    # where the xt value is percent-encoded (e.g. urn%3Abtih%3A...). The
+    # canonical form keeps `urn:btih:` unencoded; only the rest of the
+    # value (dn, xs) gets percent-encoded.
+    parts = [
+        f"xt=urn:btih:{fake_btih}",
+        f"dn={urllib.parse.quote(dn, safe='')}",
+        f"xs={urllib.parse.quote(payload, safe='')}",
+    ]
+    return "magnet:?" + "&".join(parts)
 
 
 @dataclass
