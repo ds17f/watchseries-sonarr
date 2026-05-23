@@ -79,6 +79,11 @@ def _tv_search(q, tmdbid, tvdbid, imdbid, season, ep) -> list[dict]:
         title, year = _tmdb_details("tv", tmdb_id) if tmdb_id else (q or "", "")
 
     if not tmdb_id:
+        # Prowlarr/Sonarr test their connection with empty-query searches and
+        # require ≥1 result to consider the indexer working. Return a sentinel
+        # release that's clearly a placeholder.
+        if not q:
+            return [_test_release(CAT_TV)]
         return []
     title = title or q or f"tmdb-{tmdb_id}"
 
@@ -100,6 +105,8 @@ def _movie_search(q, tmdbid, imdbid) -> list[dict]:
     else:
         title, year = _tmdb_details("movie", tmdb_id) if tmdb_id else (q or "", "")
     if not tmdb_id:
+        if not q:
+            return [_test_release(CAT_MOVIE)]
         return []
     title = title or q or f"tmdb-{tmdb_id}"
     return [_movie_release(tmdb_id, title, year)]
@@ -168,6 +175,25 @@ def _movie_release(tmdb_id: str, title: str, year: str) -> dict:
         "category": CAT_MOVIE,
         "pubDate": dt.datetime.now(dt.timezone.utc),
         "attrs": {"tmdb": tmdb_id},
+    }
+
+
+def _test_release(category: str) -> dict:
+    """A no-op placeholder release returned for empty test queries so
+    Prowlarr/Sonarr see ≥1 result and consider the indexer healthy.
+    Adding it as a real candidate to Sonarr would no-op cleanly — the
+    fake-qBittorrent layer accepts the magnet, kicks off a job that finds
+    no sources for tmdb=0, and ends in STATE_ERROR.
+    """
+    return {
+        "title": "watchseries-grabber.indexer.online.TEST",
+        "guid": "watchseries:test",
+        "link": make_magnet("tv", "0", "indexer-test",
+                            season=1, episode=1, quality="360p"),
+        "size": 1,
+        "category": category,
+        "pubDate": dt.datetime.now(dt.timezone.utc),
+        "attrs": {"test": "1"},
     }
 
 
