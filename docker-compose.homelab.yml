@@ -1,14 +1,40 @@
-# Homelab-specific override.
-# Used at home.silberg.cloud where caddy_network already exists as an
-# external network (created by services/caddy). To enable, copy this file
-# in alongside docker-compose.yml and bring up with both:
+# Homelab variant: route all container traffic through the existing
+# `gluetun-vpn` container (which provides NordVPN tunneling for qBittorrent).
 #
-#   docker compose -f docker-compose.yml -f docker-compose.homelab.yml up -d
+# This is a complete alternate compose file — use it INSTEAD of
+# docker-compose.yml, not on top of it. On the home server:
 #
-# Or, simpler: rename to compose.override.yml — docker compose picks that
-# up automatically.
+#   docker compose -f docker-compose.homelab.yml up -d --build
+#
+# Prereqs on home.silberg.cloud:
+#   1. The `gluetun-vpn` container must be running (services/vpn-services).
+#   2. gluetun must publish port 8765 on the host so Sonarr can reach us
+#      via http://gluetun:8765 (caddy_network) or http://192.168.2.200:8765
+#      (host network). Add to services/vpn-services/docker-compose.yml under
+#      gluetun's `ports:`:
+#         - "8765:8765"
+#
+# Because we share gluetun's network namespace, we cannot declare our own
+# `ports:` or `networks:` here. The container is reachable only via the
+# port mapping gluetun exposes on its behalf.
 
-networks:
-  caddy_network:
-    external: true
-    name: caddy_network
+services:
+  watchseries-grabber:
+    build: .
+    image: watchseries-grabber:latest
+    container_name: watchseries-grabber
+    user: "${PUID:-1000}:${PGID:-1000}"
+    network_mode: "container:gluetun-vpn"
+    environment:
+      - TZ=${TZ:-UTC}
+      - WSG_DOWNLOAD_DIR=/downloads
+      - WSG_INDEXER_TITLE=${WSG_INDEXER_TITLE:-WatchSeries.bar}
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+    volumes:
+      - ${DOWNLOADS_DIR:-./downloads}:/downloads
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
