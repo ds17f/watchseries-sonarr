@@ -1,0 +1,9 @@
+node_modules
+__pycache__
+*.pyc
+.git
+.gitignore
+PLAN.md
+README.md
+.venv
+*.swp

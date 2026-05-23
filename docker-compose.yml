@@ -1,0 +1,33 @@
+services:
+  watchseries-grabber:
+    build: .
+    image: watchseries-grabber:latest
+    container_name: watchseries-grabber
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      - TZ=${TZ:-UTC}
+      - WSG_DOWNLOAD_DIR=/downloads
+      - WSG_INDEXER_TITLE=${WSG_INDEXER_TITLE:-WatchSeries.bar}
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+    volumes:
+      # DOWNLOADS_DIR is the host path that Sonarr/Radarr already watches.
+      # Inside the container it's always /downloads.
+      - ${DOWNLOADS_DIR:-./downloads}:/downloads
+    ports:
+      - "${HOST_PORT:-8765}:8765"
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - default
+      - caddy_network
+
+networks:
+  # caddy_network is only used in the homelab deploy; the override file marks
+  # it external. Locally, docker creates it as a regular network so the compose
+  # file works standalone.
+  caddy_network:
+    driver: bridge

@@ -1,0 +1,14 @@
+# Homelab-specific override.
+# Used at home.silberg.cloud where caddy_network already exists as an
+# external network (created by services/caddy). To enable, copy this file
+# in alongside docker-compose.yml and bring up with both:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.homelab.yml up -d
+#
+# Or, simpler: rename to compose.override.yml — docker compose picks that
+# up automatically.
+
+networks:
+  caddy_network:
+    external: true
+    name: caddy_network
