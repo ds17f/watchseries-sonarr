@@ -16,7 +16,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
-from . import fakeqbt, torznab
+from . import dashboard, fakeqbt, torznab
 from .jobs import JobManager
 from .scraper import check_environment
 
@@ -38,15 +38,7 @@ def create_app() -> FastAPI:
                 "download_dir": str(download_dir),
                 "jobs": len(job_manager.list())}
 
-    @app.get("/")
-    def root():
-        return {
-            "service": "watchseries-grabber",
-            "torznab": "/torznab/api?t=caps",
-            "qbittorrent": "/api/v2/",
-            "health": "/health",
-        }
-
+    app.include_router(dashboard.router)  # mounts GET /
     app.include_router(torznab.router, prefix="/torznab")
     app.include_router(fakeqbt.router, prefix="/api/v2")
     return app

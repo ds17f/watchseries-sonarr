@@ -266,4 +266,6 @@ def _job_to_dict(job: Job) -> dict:
         "auto_tmm": False, "total_size": job.size_total or 0,
         "max_ratio": -1, "max_seeding_time": -1,
         "seeding_time": 0, "seen_complete": -1,
+        # Non-standard field used by the dashboard.
+        "error_message": job.error,
     }
