@@ -100,12 +100,15 @@ class JobManager:
         job = self._jobs.get(h)
         if job is None:
             return False
-        # Reset transient state, keep files list so resume works.
+        # Reset transient state, keep files list so resume works. Don't
+        # zero progress — recompute from the already-recorded files so the
+        # UI doesn't flash 0% before the worker hits the first missing
+        # episode.
         job.error = ""
         job.state = STATE_QUEUED
-        job.progress = 0.0
         job.current_unit_progress = 0.0
         job.current_unit_label = ""
+        _update_progress(job)
         self._persist(job)
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
         return True
@@ -182,6 +185,7 @@ class JobManager:
                     n = tmdb_season_episode_count(job.tmdb_id, s)
                     total += n or 20
                 job.expected_units = max(1, total)
+            _update_progress(job)  # reflect any already-downloaded files
             self._persist(job)
             job.content_path.mkdir(parents=True, exist_ok=True)
 

@@ -187,6 +187,18 @@ async function tick() {
   }
 }
 
+// Hashes whose <details> file list the user has manually opened. Persisted
+// across re-renders so polling doesn't snap them shut every 3s.
+const openHashes = new Set();
+document.addEventListener("toggle", (e) => {
+  const d = e.target.closest("details.files");
+  if (!d) return;
+  const h = d.dataset.hash;
+  if (!h) return;
+  if (d.open) openHashes.add(h);
+  else openHashes.delete(h);
+}, true);
+
 async function render(jobs) {
   const root = document.getElementById("jobs");
   if (!jobs.length) {
@@ -206,7 +218,7 @@ async function render(jobs) {
       ? `<div class="err-msg">${esc(j.error_message)}</div>` : "";
     const files = fileLists[i] || [];
     const fileBlock = files.length ? `
-      <details class="files">
+      <details class="files" data-hash="${esc(j.hash)}">
         <summary>${files.length} file${files.length === 1 ? "" : "s"}</summary>
         <ul>${files.map(f => `<li>${esc(f.name)} <span style="color:var(--muted)">(${fmtBytes(f.size)})</span></li>`).join("")}</ul>
       </details>` : "";
@@ -246,6 +258,10 @@ async function render(jobs) {
         ${fileBlock}
       </div>`;
   }).join("");
+  // Restore <details> open state after the innerHTML rebuild.
+  root.querySelectorAll("details.files").forEach(d => {
+    if (openHashes.has(d.dataset.hash)) d.open = true;
+  });
 }
 
 document.addEventListener("click", async (e) => {
