@@ -53,13 +53,17 @@ def disk_listing() -> list[dict]:
                 files += 1
                 if fn.endswith(".part"):
                     partials += 1
+        is_ours = entry.name.endswith(".watchseries")
         out.append({
             "name": entry.name,
             "size": total,
             "files": files,
             "partials": partials,
             "tracked": entry.name in tracked,
+            "ours": is_ours,
         })
+    # Show our stuff first, then alphabetical.
+    out.sort(key=lambda r: (not r["ours"], r["name"].lower()))
     return out
 
 
@@ -210,6 +214,9 @@ _HTML = r"""<!doctype html>
     }
     .disk-row .badge.tracked { background: rgba(88,166,255,0.15); color: var(--accent); }
     .disk-row .badge.orphan { background: rgba(210,153,34,0.15); color: var(--warn); }
+    .disk-row.foreign { opacity: 0.55; }
+    .disk-row.foreign .badge { background: var(--panel-2); color: var(--muted); }
+    .disk-divider { margin: 10px 0 6px; padding-left: 4px; font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
     .bar {
       position: relative; height: 8px; background: var(--panel-2);
       border-radius: 999px; overflow: hidden; margin: 8px 0 12px;
@@ -344,7 +351,9 @@ function renderDisk(rows) {
   const totalBytes = rows.reduce((s, r) => s + (r.size || 0), 0);
   const orphans = rows.filter(r => !r.tracked).length;
   summary.textContent = `${rows.length} dir${rows.length === 1 ? "" : "s"} · ${fmtBytes(totalBytes)} total · ${orphans} orphan${orphans === 1 ? "" : "s"}`;
-  root.innerHTML = rows.map(r => {
+  const ours = rows.filter(r => r.ours);
+  const others = rows.filter(r => !r.ours);
+  const renderRow = r => {
     const partials = r.partials > 0 ? ` <span style="color:var(--warn)">· ${r.partials} .part</span>` : "";
     const badge = r.tracked
       ? '<span class="badge tracked">tracked</span>'
@@ -353,7 +362,7 @@ function renderDisk(rows) {
       ? '<span></span>'
       : `<button class="btn" data-disk-delete="${esc(r.name)}">delete</button>`;
     return `
-      <div class="disk-row">
+      <div class="disk-row ${r.ours ? "" : "foreign"}">
         <div>
           <div class="disk-name">${esc(r.name)}</div>
           <div class="disk-meta">${r.files} file${r.files === 1 ? "" : "s"}${partials}</div>
@@ -363,7 +372,17 @@ function renderDisk(rows) {
         <div></div>
         <div style="text-align:right">${delBtn}</div>
       </div>`;
-  }).join("");
+  };
+  let html = "";
+  if (ours.length) {
+    html += '<div class="disk-divider">from this service</div>';
+    html += ours.map(renderRow).join("");
+  }
+  if (others.length) {
+    html += '<div class="disk-divider">other downloads (shared dir)</div>';
+    html += others.map(renderRow).join("");
+  }
+  root.innerHTML = html;
 }
 
 // Hashes whose <details> file list the user has manually opened. Snapshot
