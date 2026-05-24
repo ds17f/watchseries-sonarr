@@ -152,6 +152,42 @@ Sonarr's import works with no Remote Path Mapping.
 If Sonarr sees the same files under a different path, configure
 Sonarr → Settings → Download Clients → Remote Path Mappings.
 
+### Routing specific shows through this indexer
+
+The cleanest way to "make Sonarr auto-grab show X from WatchSeries and ignore
+torrent indexers for it": **indexer tags**.
+
+1. **Create a tag.** Sonarr → Settings → Tags → `+` → e.g. `watchseries`.
+   (Tags are auto-created the first time you assign one, too.)
+2. **Tag the indexer.** Sonarr → Settings → Indexers → WatchSeries → Tags:
+   `watchseries`. Same in Radarr if you use it for movies.
+3. **Tag each show you want routed here.** Sonarr → Series → Edit → Tags:
+   `watchseries`. Bulk-edit works too.
+
+Once both sides share the tag, Sonarr's behaviour becomes:
+
+- **Tagged series → only the matching indexers search it.** WatchSeries
+  is the only source for those shows; RSS sync (~15 min) auto-grabs new
+  monitored episodes; interactive search returns only WatchSeries results.
+- **Untagged series → only untagged indexers search it.** Other shows keep
+  using torrents as normal; WatchSeries never sees them.
+
+This is preferred over a Custom-Format-by-release-group approach because:
+
+- No score fights — a higher-scored torrent won't beat the WatchSeries
+  release just because it's a higher quality tier you don't actually care
+  about for that show.
+- Search load is per-show. We don't get hammered by RSS queries for shows
+  that aren't on watchseries.bar anyway.
+- Clean per-show opt-in, no global preferences to maintain.
+
+If you instead want WatchSeries as a *fallback* (only used when nothing
+else returns), no tag config needed — just lower its **Indexer Priority**
+(Sonarr → Indexer → Priority field, lower number = higher priority, so set
+WatchSeries to 50). Sonarr considers all indexers but breaks ties by
+priority and falls back to lower-priority sources when higher ones return
+nothing.
+
 ### Caveats
 
 - **`TMDB_API_KEY` strongly recommended.** Without it, only ID-based searches
