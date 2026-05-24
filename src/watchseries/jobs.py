@@ -53,6 +53,7 @@ class Job:
     current_unit_progress: float = 0.0  # 0-1 of the file ffmpeg is on right now
     current_unit_label: str = ""  # e.g. "S01E07" or "Movie"
     current_unit_started_at: float = 0.0  # epoch seconds; for ETA
+    canceled: bool = False  # set by delete(); workers check this and exit
     added_on: float = field(default_factory=time.time)
     state: str = STATE_QUEUED
     size_total: int = 0
@@ -70,6 +71,10 @@ class Job:
 DEFAULT_MAX_PARALLEL = 2
 
 
+class _Canceled(Exception):
+    """Raised when a job's `canceled` flag is set mid-download."""
+
+
 class JobManager:
     def __init__(self, default_save_path: Path, store=None):
         self.default_save_path = default_save_path
@@ -80,6 +85,7 @@ class JobManager:
         # the limit. Changing max_parallel at runtime takes effect for
         # queued jobs immediately; jobs already running continue.
         self._active: set[str] = set()
+        self._active_procs: dict[str, dict] = {}  # hash -> {"proc": Popen|None}
         self._slot_cv = threading.Condition()
         self.max_parallel = DEFAULT_MAX_PARALLEL
         if store is not None:
@@ -159,14 +165,33 @@ class JobManager:
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
         return True
 
-    def delete(self, h: str) -> None:
+    def delete(self, h: str, delete_files: bool = False) -> None:
         with self._lock:
-            self._jobs.pop(h, None)
+            job = self._jobs.pop(h, None)
+        if job is not None:
+            # Flag the running worker to bail out at the next checkpoint.
+            job.canceled = True
+            # Kill the in-flight ffmpeg so we don't wait for the current
+            # episode to finish before honoring the delete.
+            active = self._active_procs.get(h)
+            if active and active.get("proc") is not None:
+                try:
+                    active["proc"].terminate()
+                except Exception:
+                    pass
+            if delete_files:
+                import shutil
+                shutil.rmtree(job.content_path, ignore_errors=True)
         if self._store is not None:
             try:
                 self._store.delete(h)
             except Exception:
                 pass
+        # Wake any worker blocked on _acquire_slot — its slot might just
+        # have freed if the deleted job was active.
+        with self._slot_cv:
+            self._active.discard(h)
+            self._slot_cv.notify_all()
 
     def add_from_magnet(self, magnet: str, save_path: Path | None,
                         category: str) -> Job | None:
@@ -203,11 +228,12 @@ class JobManager:
         return job
 
     def _persist(self, job: Job) -> None:
-        if self._store is not None:
-            try:
-                self._store.save(job)
-            except Exception:
-                pass  # persistence is best-effort; don't break a download
+        if self._store is None or job.canceled:
+            return
+        try:
+            self._store.save(job)
+        except Exception:
+            pass  # persistence is best-effort; don't break a download
 
     # ---- worker ----
 
@@ -215,6 +241,9 @@ class JobManager:
         missed: list[str] = []
         # Wait for a slot if too many jobs are already running.
         self._acquire_slot(job)
+        if job.canceled:
+            self._release_slot(job)
+            return
         try:
             job.state = STATE_DOWNLOADING
             job.error = ""
@@ -266,6 +295,10 @@ class JobManager:
             job.progress = 1.0
             job.state = STATE_FINISHED
             self._persist(job)
+        except _Canceled:
+            # Worker stopped because the user deleted the job. Don't update
+            # state or persist — the record's already gone.
+            pass
         except Exception as e:
             job.state = STATE_ERROR
             job.error = repr(e)
@@ -323,9 +356,10 @@ class JobManager:
         missed: list[str] = []
         total = tmdb_season_episode_count(job.tmdb_id, season)
         if total is None:
-            # No TMDB info — probe until we get N consecutive failures.
             return self._download_season_probe(job, season)
         for ep in range(1, total + 1):
+            if job.canceled:
+                return missed
             if not self._download_episode(job, season, ep):
                 missed.append(f"S{season:02d}E{ep:02d}")
         return missed
@@ -377,9 +411,21 @@ class JobManager:
                 job.current_unit_progress = min(1.0, done / total)
                 _update_progress(job)
 
+        active = {"proc": None}
+
+        def sink(proc):
+            active["proc"] = proc
+
         job.current_unit_progress = 0.0
         job.current_unit_started_at = time.time()
-        ok = ffmpeg_download(m3u8, dest, progress_cb=cb)
+        # Register this job so delete() can kill the ffmpeg in-flight.
+        self._active_procs[job.hash] = active
+        try:
+            ok = ffmpeg_download(m3u8, dest, progress_cb=cb, proc_sink=sink)
+        finally:
+            self._active_procs.pop(job.hash, None)
+        if job.canceled:
+            raise _Canceled()
         if not ok:
             raise RuntimeError(f"ffmpeg failed for {dest.name}")
         job.current_unit_progress = 0.0

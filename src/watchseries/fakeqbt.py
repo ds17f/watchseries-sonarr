@@ -120,11 +120,11 @@ async def torrents_delete(request: Request) -> Response:
     assert _jobs is not None
     form = await _read_form(request)
     hashes = form.get("hashes", "")
-    # delete_files = form.get("deleteFiles", "false")
+    delete_files = str(form.get("deleteFiles", "false")).lower() == "true"
     for h in hashes.split("|"):
         h = h.strip().lower()
         if h:
-            _jobs.delete(h)
+            _jobs.delete(h, delete_files=delete_files)
     return Response(status_code=200)
 
 

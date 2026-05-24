@@ -121,11 +121,16 @@ def parse_watchseries_url(url: str) -> tuple[str, str, str]:
     return m.group(1), m.group(2), m.group(3)
 
 
-def ffmpeg_download(m3u8: str, dest: Path, progress_cb=None) -> bool:
+def ffmpeg_download(m3u8: str, dest: Path, progress_cb=None,
+                    proc_sink=None) -> bool:
     """Download an HLS stream to MP4. Returns True on success.
 
     progress_cb(seconds_done: float, total_seconds: float | None) is called
     periodically while downloading, parsed from ffmpeg's stderr.
+
+    proc_sink(proc) is called with the Popen as soon as ffmpeg starts, so
+    the caller can terminate it on cancel. proc_sink(None) is called when
+    the process has exited.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
@@ -138,6 +143,8 @@ def ffmpeg_download(m3u8: str, dest: Path, progress_cb=None) -> bool:
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                             stderr=subprocess.PIPE, text=True)
+    if proc_sink is not None:
+        proc_sink(proc)
     total_seconds = None
     last_seconds = 0.0
     assert proc.stderr is not None
@@ -154,6 +161,8 @@ def ffmpeg_download(m3u8: str, dest: Path, progress_cb=None) -> bool:
             if progress_cb:
                 progress_cb(last_seconds, total_seconds)
     proc.wait()
+    if proc_sink is not None:
+        proc_sink(None)
     if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size < 100_000:
         if tmp.exists():
             tmp.unlink()
