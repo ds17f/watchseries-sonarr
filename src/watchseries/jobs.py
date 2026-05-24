@@ -49,6 +49,10 @@ class Job:
     category: str
     episodes: list[Episode] = field(default_factory=list)  # explicit list of episodes
     season_pack: int | None = None  # set when whole season requested
+    expected_units: int = 1  # total episodes/files this job will produce
+    current_unit_progress: float = 0.0  # 0-1 of the file ffmpeg is on right now
+    current_unit_label: str = ""  # e.g. "S01E07" or "Movie"
+    current_unit_started_at: float = 0.0  # epoch seconds; for ETA
     added_on: float = field(default_factory=time.time)
     state: str = STATE_QUEUED
     size_total: int = 0
@@ -147,6 +151,21 @@ class JobManager:
         try:
             job.state = STATE_DOWNLOADING
             job.error = ""
+            # Set expected episode count up-front so progress is meaningful.
+            if job.media_type == "movie":
+                job.expected_units = 1
+            elif job.episodes:
+                job.expected_units = max(1, len(job.episodes))
+            elif job.season_pack is not None:
+                n = tmdb_season_episode_count(job.tmdb_id, job.season_pack)
+                job.expected_units = n or 20  # fallback estimate
+            else:
+                seasons = tmdb_seasons(job.tmdb_id) or [1]
+                total = 0
+                for s in seasons:
+                    n = tmdb_season_episode_count(job.tmdb_id, s)
+                    total += n or 20
+                job.expected_units = max(1, total)
             self._persist(job)
             job.content_path.mkdir(parents=True, exist_ok=True)
 
@@ -186,6 +205,7 @@ class JobManager:
 
     def _download_movie(self, job: Job) -> bool:
         dest = job.content_path / f"{safe_name(job.title)}.mp4"
+        job.current_unit_label = "Movie"
         if _existing_ok(dest):
             self._record_file(job, dest)
             return True
@@ -207,6 +227,7 @@ class JobManager:
     def _download_episode(self, job: Job, season: int, episode: int) -> bool:
         season_dir = job.content_path / f"Season {season:02d}"
         dest = season_dir / f"{safe_name(job.title)} - s{season:02d}e{episode:02d}.mp4"
+        job.current_unit_label = f"S{season:02d}E{episode:02d}"
         if _existing_ok(dest):
             self._record_file(job, dest)
             return True
@@ -283,11 +304,15 @@ class JobManager:
     def _run_ffmpeg(self, job: Job, m3u8: str, dest: Path) -> None:
         def cb(done: float, total: float | None):
             if total:
-                job.progress = min(1.0, done / total)
+                job.current_unit_progress = min(1.0, done / total)
+                _update_progress(job)
 
+        job.current_unit_progress = 0.0
+        job.current_unit_started_at = time.time()
         ok = ffmpeg_download(m3u8, dest, progress_cb=cb)
         if not ok:
             raise RuntimeError(f"ffmpeg failed for {dest.name}")
+        job.current_unit_progress = 0.0
         self._record_file(job, dest)
 
     def _record_file(self, job: Job, dest: Path) -> None:
@@ -300,6 +325,7 @@ class JobManager:
             job.size_total = max(job.size_total, job.size_done)
         except FileNotFoundError:
             pass
+        _update_progress(job)
         self._persist(job)
 
 
@@ -320,6 +346,16 @@ def _retry_sources(media_type: str, tmdb_id: str, title: str,
             pass
         time.sleep(backoff * (i + 1))
     return last
+
+
+def _update_progress(job: Job) -> None:
+    """Compute job-wide progress as (files_done + current_file_fraction)
+    divided by the expected total. Clamped to [0, 1)."""
+    done = len(job.files)
+    fraction = job.current_unit_progress if 0 < done + 1 <= job.expected_units else 0
+    total = max(1, job.expected_units)
+    p = (done + fraction) / total
+    job.progress = min(0.999, p)  # don't report 1.0 until _run sets it
 
 
 def _existing_ok(dest: Path) -> bool:

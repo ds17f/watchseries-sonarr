@@ -76,6 +76,12 @@ _HTML = r"""<!doctype html>
     }
     .bar-fill.ok { background: var(--ok); }
     .bar-fill.err { background: var(--err); }
+    .bar.small { height: 5px; margin-bottom: 8px; }
+    .sub {
+      display: flex; justify-content: space-between; align-items: baseline;
+      font-size: 0.82rem; color: var(--muted); margin: 6px 0 2px;
+    }
+    .sub strong { color: var(--text); font-weight: 500; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     .detail {
       display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 10px 24px; font-size: 0.85rem; color: var(--muted);
@@ -133,6 +139,13 @@ function fmtAge(ts) {
   if (s < 86400) return Math.floor(s/3600) + "h ago";
   return Math.floor(s/86400) + "d ago";
 }
+function fmtETA(s) {
+  if (!s || s < 0) return "—";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s/60) + "m " + (s % 60) + "s";
+  const h = Math.floor(s/3600); const m = Math.floor((s % 3600) / 60);
+  return h + "h " + m + "m";
+}
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -176,6 +189,16 @@ async function render(jobs) {
         <summary>${files.length} file${files.length === 1 ? "" : "s"}</summary>
         <ul>${files.map(f => `<li>${esc(f.name)} <span style="color:var(--muted)">(${fmtBytes(f.size)})</span></li>`).join("")}</ul>
       </details>` : "";
+    const completedUnits = j.completed_units ?? 0;
+    const expectedUnits = j.expected_units ?? 1;
+    const curLabel = j.current_unit_label || "";
+    const curPct = ((j.current_unit_progress || 0) * 100).toFixed(1);
+    const showSub = j.state === "downloading" && expectedUnits > 1 && curLabel;
+    const subBlock = showSub ? `
+        <div class="sub"><span>now: <strong>${esc(curLabel)}</strong> &nbsp;(${completedUnits}/${expectedUnits} done)</span><span>${curPct}%</span></div>
+        <div class="bar small"><div class="bar-fill" style="width:${curPct}%"></div></div>
+      ` : "";
+    const eta = j.eta_seconds;
     return `
       <div class="job">
         <div class="job-head">
@@ -183,11 +206,13 @@ async function render(jobs) {
           <span class="state ${esc(j.state)}">${esc(j.state)} · ${pct}%</span>
         </div>
         <div class="bar"><div class="bar-fill ${fillClass}" style="width:${pct}%"></div></div>
+        ${subBlock}
         <div class="detail">
+          <div><strong>eta</strong>${fmtETA(eta)}</div>
           <div><strong>added</strong>${fmtAge(j.added_on)}</div>
-          <div><strong>category</strong><code>${esc(j.category || "—")}</code></div>
           <div><strong>downloaded</strong>${fmtBytes(j.downloaded)}</div>
-          <div><strong>path</strong><code>${esc(j.content_path)}</code></div>
+          <div><strong>category</strong><code>${esc(j.category || "—")}</code></div>
+          <div style="grid-column:1/-1"><strong>path</strong><code>${esc(j.content_path)}</code></div>
         </div>
         ${errBlock}
         ${fileBlock}

@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     category TEXT NOT NULL DEFAULT '',
     episodes_json TEXT NOT NULL DEFAULT '[]',
     season_pack INTEGER,
+    expected_units INTEGER NOT NULL DEFAULT 1,
     added_on REAL NOT NULL,
     state TEXT NOT NULL,
     progress REAL NOT NULL DEFAULT 0.0,
@@ -57,9 +58,9 @@ class JobStore:
                 """INSERT INTO jobs
                    (hash, name, media_type, tmdb_id, title, year, quality,
                     save_path, category, episodes_json, season_pack,
-                    added_on, state, progress, size_total, size_done,
-                    error, files_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    expected_units, added_on, state, progress, size_total,
+                    size_done, error, files_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(hash) DO UPDATE SET
                      name=excluded.name,
                      state=excluded.state,
@@ -69,15 +70,16 @@ class JobStore:
                      error=excluded.error,
                      files_json=excluded.files_json,
                      episodes_json=excluded.episodes_json,
-                     season_pack=excluded.season_pack""",
+                     season_pack=excluded.season_pack,
+                     expected_units=excluded.expected_units""",
                 (
                     job.hash, job.name, job.media_type, job.tmdb_id,
                     job.title, job.year, job.quality, str(job.save_path),
                     job.category,
                     json.dumps([[e.season, e.episode] for e in job.episodes]),
-                    job.season_pack, job.added_on, job.state, job.progress,
-                    job.size_total, job.size_done, job.error,
-                    json.dumps([str(p) for p in job.files]),
+                    job.season_pack, job.expected_units, job.added_on,
+                    job.state, job.progress, job.size_total, job.size_done,
+                    job.error, json.dumps([str(p) for p in job.files]),
                 ),
             )
 
@@ -101,6 +103,7 @@ class JobStore:
                 episodes=[Episode(s, e) for s, e in
                           json.loads(r["episodes_json"] or "[]")],
                 season_pack=r["season_pack"],
+                expected_units=r.get("expected_units") or 1,
                 added_on=r["added_on"], state=r["state"],
                 progress=r["progress"],
                 size_total=r["size_total"], size_done=r["size_done"],

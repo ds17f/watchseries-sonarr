@@ -266,6 +266,26 @@ def _job_to_dict(job: Job) -> dict:
         "auto_tmm": False, "total_size": job.size_total or 0,
         "max_ratio": -1, "max_seeding_time": -1,
         "seeding_time": 0, "seen_complete": -1,
-        # Non-standard field used by the dashboard.
+        # Non-standard fields the dashboard uses.
         "error_message": job.error,
+        "current_unit_label": job.current_unit_label,
+        "current_unit_progress": job.current_unit_progress,
+        "expected_units": job.expected_units,
+        "completed_units": len(job.files),
+        "eta_seconds": _eta_seconds(job),
     }
+
+
+def _eta_seconds(job) -> int:
+    """Estimate seconds until the whole job finishes, based on the rate
+    of the current file. Returns -1 if not enough data."""
+    from .jobs import STATE_DOWNLOADING
+    if job.state != STATE_DOWNLOADING:
+        return -1
+    elapsed = time.time() - (job.current_unit_started_at or job.added_on)
+    if elapsed < 5 or job.current_unit_progress <= 0:
+        return -1
+    secs_per_unit = elapsed / max(job.current_unit_progress, 0.001)
+    units_left_after_current = max(0, job.expected_units - len(job.files) - 1)
+    seconds_left_on_current = secs_per_unit * (1 - job.current_unit_progress)
+    return int(seconds_left_on_current + units_left_after_current * secs_per_unit)
