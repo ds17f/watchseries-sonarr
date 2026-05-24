@@ -115,8 +115,14 @@ _HTML = r"""<!doctype html>
       font-size: 0.82rem;
     }
     .files summary { color: var(--muted); cursor: pointer; user-select: none; }
-    .files ul { margin: 8px 0 0; padding-left: 18px; }
-    .files li { color: var(--text); margin-bottom: 2px; }
+    .files ul { margin: 8px 0 0; padding: 0; list-style: none; }
+    .files li {
+      display: grid; grid-template-columns: 1fr 60px 80px; gap: 10px;
+      color: var(--text); padding: 3px 0;
+    }
+    .files .file-pct { text-align: right; color: var(--accent); }
+    .files .file-pct.done { color: var(--ok); }
+    .files .file-size { text-align: right; color: var(--muted); }
     .err-msg {
       color: var(--err); font-size: 0.85rem; margin-top: 8px;
       padding: 8px 12px; background: rgba(248,81,73,0.08);
@@ -172,6 +178,7 @@ function esc(s) {
 }
 
 async function tick() {
+  snapshotOpen();
   try {
     const [jobs, health] = await Promise.all([
       fetch("/api/v2/torrents/info").then(r => r.json()),
@@ -187,17 +194,18 @@ async function tick() {
   }
 }
 
-// Hashes whose <details> file list the user has manually opened. Persisted
-// across re-renders so polling doesn't snap them shut every 3s.
+// Hashes whose <details> file list the user has manually opened. Snapshot
+// from the live DOM right before each re-render so polling doesn't snap
+// them shut. The toggle event doesn't bubble and details elements get
+// destroyed by innerHTML before any close event would fire, so we read
+// the open state directly from the DOM instead.
 const openHashes = new Set();
-document.addEventListener("toggle", (e) => {
-  const d = e.target.closest("details.files");
-  if (!d) return;
-  const h = d.dataset.hash;
-  if (!h) return;
-  if (d.open) openHashes.add(h);
-  else openHashes.delete(h);
-}, true);
+function snapshotOpen() {
+  openHashes.clear();
+  document.querySelectorAll("details.files[open]").forEach(d => {
+    if (d.dataset.hash) openHashes.add(d.dataset.hash);
+  });
+}
 
 async function render(jobs) {
   const root = document.getElementById("jobs");
@@ -217,10 +225,17 @@ async function render(jobs) {
     const errBlock = (j.state === "error" && j.error_message)
       ? `<div class="err-msg">${esc(j.error_message)}</div>` : "";
     const files = fileLists[i] || [];
-    const fileBlock = files.length ? `
+    const inProgress = j.state === "downloading" && curLabel ? curLabel : null;
+    const rows = files.map(f =>
+      `<li><span class="file-name">${esc(f.name)}</span><span class="file-pct done">100%</span><span class="file-size">${fmtBytes(f.size)}</span></li>`
+    );
+    if (inProgress) {
+      rows.push(`<li><span class="file-name">${esc(inProgress)} <em style="color:var(--muted);font-style:normal">· downloading</em></span><span class="file-pct">${curPct}%</span><span class="file-size">—</span></li>`);
+    }
+    const fileBlock = rows.length ? `
       <details class="files" data-hash="${esc(j.hash)}">
-        <summary>${files.length} file${files.length === 1 ? "" : "s"}</summary>
-        <ul>${files.map(f => `<li>${esc(f.name)} <span style="color:var(--muted)">(${fmtBytes(f.size)})</span></li>`).join("")}</ul>
+        <summary>${files.length} done${inProgress ? ` · 1 in progress` : ""}${expectedUnits > files.length + (inProgress ? 1 : 0) ? ` · ${expectedUnits - files.length - (inProgress ? 1 : 0)} pending` : ""}</summary>
+        <ul>${rows.join("")}</ul>
       </details>` : "";
     const completedUnits = j.completed_units ?? 0;
     const expectedUnits = j.expected_units ?? 1;
