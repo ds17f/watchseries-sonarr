@@ -308,6 +308,51 @@ _HTML = r"""<!doctype html>
     }
     .footer a { color: var(--accent); text-decoration: none; }
     .footer a:hover { text-decoration: underline; }
+
+    /* Mobile / narrow-viewport layout */
+    @media (max-width: 720px) {
+      header { padding: 14px 16px; }
+      h1 { font-size: 1.1rem; }
+      .meta { font-size: 0.78rem; }
+      main { padding: 16px 14px 60px; }
+
+      /* Title above actions instead of beside */
+      .job { padding: 14px 14px; }
+      .job-head {
+        flex-direction: column; align-items: stretch; gap: 8px;
+      }
+      .job-name { font-size: 0.82rem; }
+      .actions { justify-content: flex-end; }
+
+      /* Two-column detail grid */
+      .detail { grid-template-columns: 1fr 1fr; gap: 8px 16px; font-size: 0.8rem; }
+      .detail > div[style*="grid-column"] { grid-column: 1/-1 !important; }
+
+      /* Settings strip wraps */
+      .settings { flex-wrap: wrap; padding: 10px 12px; }
+      .settings .indicator { margin-left: 0; flex-basis: 100%; }
+
+      /* Disk rows: name+meta row 1, size/badge/action row 2 */
+      .disk-row {
+        grid-template-columns: 1fr auto;
+        grid-template-areas:
+          "name size"
+          "name badge"
+          "meta action";
+        padding: 10px 12px;
+      }
+      .disk-row > div:nth-child(1) { grid-area: name; min-width: 0; }
+      .disk-row .size-text, .disk-row > div:nth-child(2) { grid-area: size; }
+      .disk-row .badge-cell, .disk-row > div:nth-child(3) { grid-area: badge; }
+      .disk-row > div:nth-child(4) { display: none; }
+      .disk-row .action-cell, .disk-row > div:nth-child(5) { grid-area: action; }
+      .disk-row .disk-name { font-size: 0.82rem; }
+
+      .files li { grid-template-columns: 1fr 50px 70px; gap: 6px; font-size: 0.78rem; }
+
+      .section-h { margin: 24px 0 8px; }
+      .section-h h2 { font-size: 0.95rem; }
+    }
   </style>
 </head>
 <body>
