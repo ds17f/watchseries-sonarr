@@ -171,6 +171,44 @@ def fetch_subtitle(url: str, dest: Path) -> bool:
         return False
 
 
+def tmdb_season_episode_count(tmdb_id: str, season: int) -> int | None:
+    """Return the number of episodes in a season via TMDB, or None if no
+    API key set / season missing. Used so season-pack workers iterate a
+    bounded range instead of stopping on the first upstream hiccup."""
+    import os
+    key = os.environ.get("TMDB_API_KEY", "")
+    if not key:
+        return None
+    url = (f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}"
+           f"?api_key={key}")
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return None
+    eps = data.get("episodes")
+    if not eps:
+        return None
+    return len(eps)
+
+
+def tmdb_seasons(tmdb_id: str) -> list[int] | None:
+    """Return the list of season numbers (excluding specials/0) for a show.
+    Used by full-series workers to iterate seasons in TMDB order."""
+    import os
+    key = os.environ.get("TMDB_API_KEY", "")
+    if not key:
+        return None
+    url = f"https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={key}"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return None
+    seasons = data.get("seasons", [])
+    return [s["season_number"] for s in seasons if s.get("season_number", 0) > 0]
+
+
 def check_environment() -> list[str]:
     """Return a list of missing dependencies (empty = ready)."""
     missing = []

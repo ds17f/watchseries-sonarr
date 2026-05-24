@@ -19,6 +19,8 @@ from .scraper import (
     pick_source,
     safe_name,
     fetch_subtitle,
+    tmdb_season_episode_count,
+    tmdb_seasons,
 )
 
 # qBittorrent state strings Sonarr understands.
@@ -141,6 +143,7 @@ class JobManager:
     # ---- worker ----
 
     def _run(self, job: Job) -> None:
+        missed: list[str] = []
         try:
             job.state = STATE_DOWNLOADING
             job.error = ""
@@ -148,18 +151,29 @@ class JobManager:
             job.content_path.mkdir(parents=True, exist_ok=True)
 
             if job.media_type == "movie":
-                self._download_movie(job)
+                if not self._download_movie(job):
+                    missed.append("movie")
             elif job.episodes:
                 for ep in job.episodes:
-                    self._download_episode(job, ep.season, ep.episode)
+                    if not self._download_episode(job, ep.season, ep.episode):
+                        missed.append(f"S{ep.season:02d}E{ep.episode:02d}")
             elif job.season_pack is not None:
-                self._download_season(job, job.season_pack)
+                missed += self._download_season(job, job.season_pack)
             else:
-                self._download_series(job)
+                missed += self._download_series(job)
 
             if not job.files:
                 job.state = STATE_ERROR
                 job.error = "no episodes were downloaded"
+                self._persist(job)
+                return
+            if missed:
+                # Partial success: some episodes failed. Mark as error so the
+                # user can see what's incomplete; files already downloaded
+                # are kept on disk for Sonarr to import what's available.
+                job.state = STATE_ERROR
+                job.error = f"missing episodes: {', '.join(missed[:20])}" + (
+                    f" (+{len(missed)-20} more)" if len(missed) > 20 else "")
                 self._persist(job)
                 return
             job.progress = 1.0
@@ -170,74 +184,101 @@ class JobManager:
             job.error = repr(e)
             self._persist(job)
 
-    def _download_movie(self, job: Job) -> None:
+    def _download_movie(self, job: Job) -> bool:
         dest = job.content_path / f"{safe_name(job.title)}.mp4"
         if _existing_ok(dest):
             self._record_file(job, dest)
-            return
-        srcs = get_sources("movie", job.tmdb_id, job.title, year=job.year)
+            return True
+        srcs = _retry_sources("movie", job.tmdb_id, job.title, year=job.year)
         if srcs is None:
-            raise RuntimeError("no sources for movie")
+            return False
         src = pick_source(srcs.sources, job.quality)
         if not src:
-            raise RuntimeError("no playable source quality")
-        self._run_ffmpeg(job, src.url, dest)
+            return False
+        try:
+            self._run_ffmpeg(job, src.url, dest)
+        except Exception:
+            return False
         for s in srcs.subtitles:
             ext = Path(s.url).suffix or ".vtt"
             fetch_subtitle(s.url, dest.with_name(f"{dest.stem}.{s.lang}{ext}"))
+        return True
 
-    def _download_episode(self, job: Job, season: int, episode: int) -> None:
+    def _download_episode(self, job: Job, season: int, episode: int) -> bool:
         season_dir = job.content_path / f"Season {season:02d}"
         dest = season_dir / f"{safe_name(job.title)} - s{season:02d}e{episode:02d}.mp4"
         if _existing_ok(dest):
             self._record_file(job, dest)
-            return
-        srcs = get_sources("tv", job.tmdb_id, job.title, season, episode)
+            return True
+        srcs = _retry_sources("tv", job.tmdb_id, job.title, season, episode)
         if srcs is None:
-            return  # episode missing — skip silently
+            return False
         src = pick_source(srcs.sources, job.quality)
         if not src:
-            return
-        self._run_ffmpeg(job, src.url, dest)
+            return False
+        try:
+            self._run_ffmpeg(job, src.url, dest)
+        except Exception:
+            return False
         for s in srcs.subtitles:
             ext = Path(s.url).suffix or ".vtt"
             fetch_subtitle(s.url, dest.with_name(f"{dest.stem}.{s.lang}{ext}"))
+        return True
 
-    def _download_season(self, job: Job, season: int) -> None:
+    def _download_season(self, job: Job, season: int) -> list[str]:
+        """Download every episode in a season. Returns list of episode
+        labels that failed. Bounded by TMDB episode count when available;
+        otherwise falls back to a probe loop with retries."""
+        missed: list[str] = []
+        total = tmdb_season_episode_count(job.tmdb_id, season)
+        if total is None:
+            # No TMDB info — probe until we get N consecutive failures.
+            return self._download_season_probe(job, season)
+        for ep in range(1, total + 1):
+            if not self._download_episode(job, season, ep):
+                missed.append(f"S{season:02d}E{ep:02d}")
+        return missed
+
+    def _download_season_probe(self, job: Job, season: int) -> list[str]:
+        """Fallback when we don't know the episode count. Tolerate up to 3
+        consecutive misses before assuming we've run past the end."""
+        missed: list[str] = []
+        consecutive_miss = 0
         ep = 1
-        while True:
-            season_dir = job.content_path / f"Season {season:02d}"
-            dest = season_dir / f"{safe_name(job.title)} - s{season:02d}e{ep:02d}.mp4"
-            if _existing_ok(dest):
-                self._record_file(job, dest)
-                ep += 1
-                continue
-            srcs = get_sources("tv", job.tmdb_id, job.title, season, ep)
-            if srcs is None:
-                break
-            src = pick_source(srcs.sources, job.quality)
-            if not src:
-                break
-            self._run_ffmpeg(job, src.url, dest)
-            for s in srcs.subtitles:
-                ext = Path(s.url).suffix or ".vtt"
-                fetch_subtitle(s.url, dest.with_name(f"{dest.stem}.{s.lang}{ext}"))
-            ep += 1
-
-    def _download_series(self, job: Job) -> None:
-        season = 1
-        empty_seasons = 0
-        while True:
-            before = len(job.files)
-            self._download_season(job, season)
-            found_any = len(job.files) > before
-            if found_any:
-                empty_seasons = 0
+        while consecutive_miss < 3 and ep <= 100:
+            if self._download_episode(job, season, ep):
+                consecutive_miss = 0
             else:
-                empty_seasons += 1
-                if empty_seasons >= 1:
-                    break
+                consecutive_miss += 1
+                missed.append(f"S{season:02d}E{ep:02d}")
+            ep += 1
+        # Trim trailing misses — those are "past the end of the season".
+        while missed and missed[-1] == f"S{season:02d}E{ep-1:02d}":
+            missed.pop()
+            ep -= 1
+        return missed
+
+    def _download_series(self, job: Job) -> list[str]:
+        """Download every season the show has. Prefers TMDB season list;
+        falls back to probing seasons until we hit one with no episodes."""
+        missed: list[str] = []
+        seasons = tmdb_seasons(job.tmdb_id)
+        if seasons:
+            for s in seasons:
+                missed += self._download_season(job, s)
+            return missed
+        # Probe-mode fallback
+        season = 1
+        empty = 0
+        while empty < 1 and season < 50:
+            before = len(job.files)
+            missed += self._download_season(job, season)
+            if len(job.files) == before:
+                empty += 1
+            else:
+                empty = 0
             season += 1
+        return missed
 
     def _run_ffmpeg(self, job: Job, m3u8: str, dest: Path) -> None:
         def cb(done: float, total: float | None):
@@ -260,6 +301,25 @@ class JobManager:
         except FileNotFoundError:
             pass
         self._persist(job)
+
+
+def _retry_sources(media_type: str, tmdb_id: str, title: str,
+                   season: int | None = None, episode: int | None = None,
+                   year: str = "", tries: int = 3, backoff: float = 2.0):
+    """Wrap get_sources with retries — upstream returns 500 for both
+    'episode doesn't exist' and transient errors, so retry a few times
+    before giving up."""
+    last: object = None
+    for i in range(tries):
+        try:
+            last = get_sources(media_type, tmdb_id, title,
+                               season=season, episode=episode, year=year)
+            if last is not None:
+                return last
+        except Exception:
+            pass
+        time.sleep(backoff * (i + 1))
+    return last
 
 
 def _existing_ok(dest: Path) -> bool:
