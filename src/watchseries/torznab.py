@@ -31,11 +31,20 @@ router = APIRouter()
 CAT_TV = "5000"
 CAT_MOVIE = "2000"
 
-# Estimated sizes Sonarr will see in the RSS (bytes). Sonarr uses these for
-# quality decisions; we make them roughly correspond to 1080p WEBDL sizes.
-SIZE_EPISODE = 1_500_000_000        # ~1.5GB per episode at 1080p
-SIZE_SEASON = 15_000_000_000        # ~15GB for a season pack
-SIZE_MOVIE = 4_000_000_000          # ~4GB for a movie
+# Bitrates we advertise per quality, in kilobits per second. Sonarr uses
+# the resulting size estimates against its profile's size-per-minute caps,
+# so these need to land inside typical 1080p WEBDL bands (~80-110 MB/min).
+QUALITY_KBPS = {"360p": 800, "720p": 2500, "1080p": 5500}
+DEFAULT_KBPS = QUALITY_KBPS["1080p"]
+# Fallback runtimes (minutes) used when TMDB doesn't have one.
+FALLBACK_EP_RUNTIME = 45
+FALLBACK_MOVIE_RUNTIME = 110
+
+
+def _size_bytes(quality: str, runtime_min: float | int) -> int:
+    """bytes ≈ kbps * 125 (bytes/sec) * 60 (sec/min) * minutes."""
+    kbps = QUALITY_KBPS.get(quality, DEFAULT_KBPS)
+    return int(kbps * 125 * 60 * max(1, runtime_min))
 
 INDEXER_TITLE = os.environ.get("WSG_INDEXER_TITLE", "WatchSeries.bar")
 
@@ -73,15 +82,16 @@ def torznab_api(
 
 def _tv_search(q, tmdbid, tvdbid, imdbid, season, ep) -> list[dict]:
     tmdb_id = tmdbid or _tmdb_from_tvdb(tvdbid) or _tmdb_from_imdb(imdbid)
+    runtime = FALLBACK_EP_RUNTIME
     if not tmdb_id and q:
-        tmdb_id, title, year = _tmdb_search_tv(q)
+        tmdb_id, title, year, runtime = _tmdb_search_tv(q)
     else:
-        title, year = _tmdb_details("tv", tmdb_id) if tmdb_id else (q or "", "")
+        if tmdb_id:
+            title, year, runtime = _tmdb_details_tv(tmdb_id)
+        else:
+            title, year = (q or ""), ""
 
     if not tmdb_id:
-        # Prowlarr/Sonarr test their connection with empty-query searches and
-        # require ≥1 result to consider the indexer working. Return a sentinel
-        # release that's clearly a placeholder.
         if not q:
             return [_test_release(CAT_TV)]
         return []
@@ -89,27 +99,35 @@ def _tv_search(q, tmdbid, tvdbid, imdbid, season, ep) -> list[dict]:
 
     items: list[dict] = []
     if season is not None and ep is not None:
-        items.append(_episode_release(tmdb_id, title, year, season, ep))
+        items.append(_episode_release(tmdb_id, title, year, season, ep, runtime))
     elif season is not None:
-        items.append(_season_pack_release(tmdb_id, title, year, season))
+        ep_count = _tmdb_season_count(tmdb_id, season) or 12
+        items.append(_season_pack_release(
+            tmdb_id, title, year, season, runtime, ep_count))
     else:
-        # Whole-series: return a generic series release that the worker resolves.
-        items.append(_series_release(tmdb_id, title, year))
+        season_counts = _tmdb_series_episode_counts(tmdb_id)
+        items.append(_series_release(
+            tmdb_id, title, year, runtime,
+            total_eps=sum(season_counts) if season_counts else 50))
     return items
 
 
 def _movie_search(q, tmdbid, imdbid) -> list[dict]:
     tmdb_id = tmdbid or _tmdb_from_imdb(imdbid)
+    runtime = FALLBACK_MOVIE_RUNTIME
     if not tmdb_id and q:
-        tmdb_id, title, year = _tmdb_search_movie(q)
+        tmdb_id, title, year, runtime = _tmdb_search_movie(q)
     else:
-        title, year = _tmdb_details("movie", tmdb_id) if tmdb_id else (q or "", "")
+        if tmdb_id:
+            title, year, runtime = _tmdb_details_movie(tmdb_id)
+        else:
+            title, year = (q or ""), ""
     if not tmdb_id:
         if not q:
             return [_test_release(CAT_MOVIE)]
         return []
     title = title or q or f"tmdb-{tmdb_id}"
-    return [_movie_release(tmdb_id, title, year)]
+    return [_movie_release(tmdb_id, title, year, runtime)]
 
 
 def _generic_search(q, tmdbid, tvdbid, imdbid) -> list[dict]:
@@ -122,56 +140,59 @@ def _generic_search(q, tmdbid, tvdbid, imdbid) -> list[dict]:
 # ---- release builders ----
 
 def _episode_release(tmdb_id: str, title: str, year: str,
-                     season: int, episode: int) -> dict:
+                     season: int, episode: int, runtime_min: int) -> dict:
     name = _release_name(title, year, season=season, episode=episode)
     magnet = make_magnet("tv", tmdb_id, title, season=season, episode=episode)
     return {
         "title": name,
         "guid": f"watchseries:tv:{tmdb_id}:s{season}e{episode}",
         "link": magnet,
-        "size": SIZE_EPISODE,
+        "size": _size_bytes("1080p", runtime_min),
         "category": CAT_TV,
         "pubDate": dt.datetime.now(dt.timezone.utc),
         "attrs": {"tmdb": tmdb_id, "season": season, "episode": episode},
     }
 
 
-def _season_pack_release(tmdb_id: str, title: str, year: str, season: int) -> dict:
+def _season_pack_release(tmdb_id: str, title: str, year: str, season: int,
+                         runtime_min: int, ep_count: int) -> dict:
     name = _release_name(title, year, season=season)
     magnet = make_magnet("tv", tmdb_id, title, season=season)
     return {
         "title": name,
         "guid": f"watchseries:tv:{tmdb_id}:s{season}",
         "link": magnet,
-        "size": SIZE_SEASON,
+        "size": _size_bytes("1080p", runtime_min * ep_count),
         "category": CAT_TV,
         "pubDate": dt.datetime.now(dt.timezone.utc),
         "attrs": {"tmdb": tmdb_id, "season": season},
     }
 
 
-def _series_release(tmdb_id: str, title: str, year: str) -> dict:
+def _series_release(tmdb_id: str, title: str, year: str,
+                    runtime_min: int, total_eps: int) -> dict:
     name = _release_name(title, year) + ".COMPLETE"
     magnet = make_magnet("tv", tmdb_id, title)
     return {
         "title": name,
         "guid": f"watchseries:tv:{tmdb_id}:all",
         "link": magnet,
-        "size": SIZE_SEASON * 5,
+        "size": _size_bytes("1080p", runtime_min * total_eps),
         "category": CAT_TV,
         "pubDate": dt.datetime.now(dt.timezone.utc),
         "attrs": {"tmdb": tmdb_id},
     }
 
 
-def _movie_release(tmdb_id: str, title: str, year: str) -> dict:
+def _movie_release(tmdb_id: str, title: str, year: str,
+                   runtime_min: int) -> dict:
     name = _release_name(title, year, is_movie=True)
     magnet = make_magnet("movie", tmdb_id, title)
     return {
         "title": name,
         "guid": f"watchseries:movie:{tmdb_id}",
         "link": magnet,
-        "size": SIZE_MOVIE,
+        "size": _size_bytes("1080p", runtime_min),
         "category": CAT_MOVIE,
         "pubDate": dt.datetime.now(dt.timezone.utc),
         "attrs": {"tmdb": tmdb_id},
@@ -251,29 +272,61 @@ def _tmdb_from_imdb(imdbid: str | None) -> str | None:
     return None
 
 
-def _tmdb_search_tv(q: str) -> tuple[str | None, str, str]:
+def _tmdb_search_tv(q: str) -> tuple[str | None, str, str, int]:
     d = _tmdb_api("/search/tv", {"query": q})
     if not d or not d.get("results"):
-        return None, q, ""
+        return None, q, "", FALLBACK_EP_RUNTIME
     r = d["results"][0]
-    return str(r["id"]), r.get("name", q), (r.get("first_air_date") or "")[:4]
+    tmdb_id = str(r["id"])
+    # Search results don't include runtime; fetch details for that.
+    _, _, runtime = _tmdb_details_tv(tmdb_id)
+    return tmdb_id, r.get("name", q), (r.get("first_air_date") or "")[:4], runtime
 
 
-def _tmdb_search_movie(q: str) -> tuple[str | None, str, str]:
+def _tmdb_search_movie(q: str) -> tuple[str | None, str, str, int]:
     d = _tmdb_api("/search/movie", {"query": q})
     if not d or not d.get("results"):
-        return None, q, ""
+        return None, q, "", FALLBACK_MOVIE_RUNTIME
     r = d["results"][0]
-    return str(r["id"]), r.get("title", q), (r.get("release_date") or "")[:4]
+    tmdb_id = str(r["id"])
+    _, _, runtime = _tmdb_details_movie(tmdb_id)
+    return tmdb_id, r.get("title", q), (r.get("release_date") or "")[:4], runtime
 
 
-def _tmdb_details(kind: str, tmdb_id: str) -> tuple[str, str]:
-    d = _tmdb_api(f"/{kind}/{tmdb_id}", {})
+def _tmdb_details_tv(tmdb_id: str) -> tuple[str, str, int]:
+    d = _tmdb_api(f"/tv/{tmdb_id}", {})
     if not d:
-        return "", ""
-    if kind == "tv":
-        return d.get("name", ""), (d.get("first_air_date") or "")[:4]
-    return d.get("title", ""), (d.get("release_date") or "")[:4]
+        return "", "", FALLBACK_EP_RUNTIME
+    rt = d.get("episode_run_time") or []
+    runtime = int(rt[0]) if rt else FALLBACK_EP_RUNTIME
+    return d.get("name", ""), (d.get("first_air_date") or "")[:4], runtime
+
+
+def _tmdb_details_movie(tmdb_id: str) -> tuple[str, str, int]:
+    d = _tmdb_api(f"/movie/{tmdb_id}", {})
+    if not d:
+        return "", "", FALLBACK_MOVIE_RUNTIME
+    runtime = int(d.get("runtime") or FALLBACK_MOVIE_RUNTIME)
+    return d.get("title", ""), (d.get("release_date") or "")[:4], runtime
+
+
+def _tmdb_season_count(tmdb_id: str, season: int) -> int | None:
+    d = _tmdb_api(f"/tv/{tmdb_id}/season/{season}", {})
+    eps = d.get("episodes") if d else None
+    return len(eps) if eps else None
+
+
+def _tmdb_series_episode_counts(tmdb_id: str) -> list[int]:
+    """Return [N_eps_s1, N_eps_s2, ...] for use in series-wide size estimates."""
+    d = _tmdb_api(f"/tv/{tmdb_id}", {})
+    if not d:
+        return []
+    out = []
+    for s in d.get("seasons", []):
+        n = s.get("episode_count")
+        if s.get("season_number", 0) > 0 and n:
+            out.append(int(n))
+    return out
 
 
 # ---- XML rendering ----
