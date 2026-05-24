@@ -333,12 +333,16 @@ _HTML = r"""<!doctype html>
     <div id="disk"></div>
 
     <div class="footer">
-      polls every 3s · <a href="/torznab/api?t=caps" target="_blank">torznab caps</a> · <a href="/health" target="_blank">health</a>
+      jobs poll every 3s · disk every 15s · <a href="/torznab/api?t=caps" target="_blank">torznab caps</a> · <a href="/health" target="_blank">health</a>
     </div>
   </main>
 
 <script>
-const POLL_MS = 3000;
+// Two cadences: jobs/health/settings poll every 3s for live progress;
+// disk top-level polls every 15s since sizes change slowly and any
+// already-expanded subtree is left alone unless the user re-clicks.
+const POLL_MS_JOBS = 3000;
+const POLL_MS_DISK = 15000;
 
 function fmtBytes(n) {
   if (!n) return "0 B";
@@ -364,34 +368,43 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-async function tick() {
-  snapshotOpen();
+async function tickJobs() {
   try {
-    const [jobs, health, disk] = await Promise.all([
+    const [jobs, health] = await Promise.all([
       fetch("/api/v2/torrents/info").then(r => r.json()),
       fetch("/health").then(r => r.json()),
-      fetch("/disk").then(r => r.json()).catch(() => []),
     ]);
     document.getElementById("meta").textContent =
       jobs.length + " job" + (jobs.length === 1 ? "" : "s") +
       " · download dir: " + health.download_dir +
       (health.missing && health.missing.length ? " · MISSING: " + health.missing.join(",") : "");
-    render(jobs);
-    renderDisk(disk);
+    await applyJobs(jobs);
   } catch (e) {
     document.getElementById("meta").textContent = "service unreachable";
   }
 }
 
-// Paths that the user has expanded; persist across polls so the tree
-// doesn't collapse during the 3s refresh.
-const expandedPaths = new Set();
-
-function snapshotExpanded() {
-  // No DOM read needed — expandedPaths is our single source of truth.
+async function tickDisk() {
+  try {
+    const disk = await fetch("/disk").then(r => r.json());
+    applyDisk(disk);
+  } catch (e) { /* ignore */ }
 }
 
-function renderDisk(rows) {
+// Paths that the user has expanded. Source of truth for which subtrees
+// should be visible after a re-render.
+const expandedPaths = new Set();
+
+// ============================================================
+// Disk section — top-level in-place update
+// ============================================================
+//
+// We render the top-level rows once and update only the size/file-count/
+// badge/delete-button fields each poll. Expanded subtrees (`.disk-children`)
+// are never touched by the poll; they're rebuilt only when the user clicks
+// the row to expand (or to manually refresh by collapse+re-expand).
+
+function applyDisk(rows) {
   const root = document.getElementById("disk");
   const summary = document.getElementById("disk-summary");
   if (!rows.length) {
@@ -402,54 +415,128 @@ function renderDisk(rows) {
   const totalBytes = rows.reduce((s, r) => s + (r.size || 0), 0);
   const orphans = rows.filter(r => r.type === "dir" && !r.tracked).length;
   summary.textContent = `${rows.length} dir${rows.length === 1 ? "" : "s"} · ${fmtBytes(totalBytes)} total · ${orphans} orphan${orphans === 1 ? "" : "s"}`;
+
+  // Build a desired-order list with dividers interleaved.
   const ours = rows.filter(r => r.ours);
   const others = rows.filter(r => !r.ours);
-  let html = "";
-  if (ours.length) {
-    html += '<div class="disk-divider">from this service</div>';
-    html += ours.map(r => renderDiskRow(r, true)).join("");
+  const ordered = [];
+  if (ours.length) ordered.push({divider: "from this service"});
+  ordered.push(...ours);
+  if (others.length) ordered.push({divider: "other downloads (shared dir)"});
+  ordered.push(...others);
+
+  // Map path -> existing row+childbox pair so we can reuse them.
+  const existing = new Map();
+  root.querySelectorAll(".disk-row[data-path]").forEach(el => {
+    existing.set(el.dataset.path, {row: el, children: el.nextElementSibling});
+  });
+
+  // Build / update in order, appending or inserting as needed.
+  const frag = document.createDocumentFragment();
+  for (const item of ordered) {
+    if (item.divider) {
+      const d = document.createElement("div");
+      d.className = "disk-divider";
+      d.textContent = item.divider;
+      frag.appendChild(d);
+      continue;
+    }
+    let pair = existing.get(item.path);
+    if (pair) {
+      updateDiskRow(pair.row, item, /*topLevel*/true);
+      // Reuse the existing children element to preserve its current state.
+      frag.appendChild(pair.row);
+      frag.appendChild(pair.children);
+      existing.delete(item.path);
+    } else {
+      const {row, children} = buildDiskRow(item, /*topLevel*/true);
+      frag.appendChild(row);
+      frag.appendChild(children);
+    }
   }
-  if (others.length) {
-    html += '<div class="disk-divider">other downloads (shared dir)</div>';
-    html += others.map(r => renderDiskRow(r, true)).join("");
+  // Anything left in `existing` no longer present on disk — drop.
+  for (const {row, children} of existing.values()) {
+    row.remove();
+    if (children && children.matches(".disk-children")) children.remove();
   }
-  root.innerHTML = html;
-  // Re-expand anything the user had opened.
-  for (const p of [...expandedPaths]) {
-    const row = root.querySelector(`.disk-row[data-path="${cssEsc(p)}"]`);
-    if (row) loadChildren(p, row, /*silent*/true);
-  }
+  // Clear and append fragment. (Removing only the divider <div>s before
+  // appending is messier than just replacing root's children with the
+  // rebuilt fragment, which preserves the per-row DOM nodes we just
+  // moved into the fragment.)
+  while (root.firstChild) root.firstChild.remove();
+  root.appendChild(frag);
 }
 
-function renderDiskRow(r, topLevel) {
-  const isDir = r.type === "dir";
-  const partials = r.partials > 0 ? ` <span style="color:var(--warn)">· ${r.partials} .part</span>` : "";
-  const badge = topLevel
-    ? (r.tracked
-        ? '<span class="badge tracked">tracked</span>'
-        : (isDir ? '<span class="badge orphan">orphan</span>' : '<span></span>'))
-    : '<span></span>';
-  const delBtn = topLevel && !r.tracked && isDir
-    ? `<button class="btn" data-disk-delete="${esc(r.name)}">delete</button>`
-    : '<span></span>';
-  const chev = isDir ? '<span class="chev">▶</span>' : '<span class="chev">·</span>';
-  return `
-    <div class="disk-row ${r.ours ? "" : (topLevel ? "foreign" : "")} ${isDir ? "is-dir" : "is-file"}"
-         data-path="${esc(r.path)}" data-is-dir="${isDir}">
-      <div>
-        <div class="disk-name">${chev} ${esc(r.name)}</div>
-        <div class="disk-meta">${r.files} file${r.files === 1 ? "" : "s"}${partials}</div>
-      </div>
-      <div class="disk-meta" style="text-align:right">${fmtBytes(r.size)}</div>
-      <div style="text-align:center">${badge}</div>
-      <div></div>
-      <div style="text-align:right">${delBtn}</div>
+function buildDiskRow(r, topLevel) {
+  const row = document.createElement("div");
+  row.dataset.path = r.path;
+  row.dataset.isDir = r.type === "dir";
+  const children = document.createElement("div");
+  children.className = "disk-children";
+  children.dataset.childrenOf = r.path;
+  children.style.display = "none";
+  // Inner structure — set once, then updateDiskRow only touches text.
+  row.innerHTML = `
+    <div>
+      <div class="disk-name"><span class="chev"></span> <span class="name-text"></span></div>
+      <div class="disk-meta meta-text"></div>
     </div>
-    <div class="disk-children" data-children-of="${esc(r.path)}" style="display:none"></div>`;
+    <div class="disk-meta size-text" style="text-align:right"></div>
+    <div style="text-align:center" class="badge-cell"></div>
+    <div></div>
+    <div style="text-align:right" class="action-cell"></div>`;
+  updateDiskRow(row, r, topLevel);
+  return {row, children};
 }
 
-function cssEsc(s) {
-  return s.replace(/(["\\])/g, "\\$1");
+function updateDiskRow(row, r, topLevel) {
+  const isDir = r.type === "dir";
+  row.className = `disk-row ${r.ours ? "" : (topLevel ? "foreign" : "")} ${isDir ? "is-dir" : "is-file"} ${expandedPaths.has(r.path) ? "open" : ""}`;
+  row.querySelector(".chev").textContent = isDir ? "▶" : "·";
+  row.querySelector(".name-text").textContent = r.name;
+  const partials = r.partials > 0 ? ` · ${r.partials} .part` : "";
+  row.querySelector(".meta-text").textContent =
+    `${r.files} file${r.files === 1 ? "" : "s"}${partials}`;
+  row.querySelector(".size-text").textContent = fmtBytes(r.size);
+
+  const badge = row.querySelector(".badge-cell");
+  if (topLevel) {
+    if (r.tracked) badge.innerHTML = '<span class="badge tracked">tracked</span>';
+    else if (isDir) badge.innerHTML = '<span class="badge orphan">orphan</span>';
+    else badge.innerHTML = "";
+  } else badge.innerHTML = "";
+
+  const action = row.querySelector(".action-cell");
+  if (topLevel && !r.tracked && isDir) {
+    if (!action.querySelector("button[data-disk-delete]")) {
+      action.innerHTML = `<button class="btn" data-disk-delete="${esc(r.name)}">delete</button>`;
+    }
+  } else {
+    action.innerHTML = "";
+  }
+}
+
+function renderDiskChildrenList(items) {
+  // For nested levels we still use innerHTML — they're small, and only
+  // get rebuilt when the user clicks (not on every poll).
+  return items.map(c => {
+    const isDir = c.type === "dir";
+    const partials = c.partials > 0 ? ` · ${c.partials} .part` : "";
+    const chev = isDir ? "▶" : "·";
+    return `
+      <div class="disk-row ${isDir ? "is-dir" : "is-file"}"
+           data-path="${esc(c.path)}" data-is-dir="${isDir}">
+        <div>
+          <div class="disk-name"><span class="chev">${chev}</span> ${esc(c.name)}</div>
+          <div class="disk-meta">${c.files} file${c.files === 1 ? "" : "s"}${partials}</div>
+        </div>
+        <div class="disk-meta" style="text-align:right">${fmtBytes(c.size)}</div>
+        <div></div>
+        <div></div>
+        <div></div>
+      </div>
+      <div class="disk-children" data-children-of="${esc(c.path)}" style="display:none"></div>`;
+  }).join("");
 }
 
 async function loadChildren(path, row, silent) {
@@ -457,7 +544,6 @@ async function loadChildren(path, row, silent) {
   if (!childBox || !childBox.matches(".disk-children")) return;
   if (!silent) {
     if (row.classList.contains("open")) {
-      // collapse
       row.classList.remove("open");
       childBox.style.display = "none";
       expandedPaths.delete(path);
@@ -470,9 +556,9 @@ async function loadChildren(path, row, silent) {
   }
   try {
     const data = await fetch("/disk?path=" + encodeURIComponent(path)).then(r => r.json());
-    childBox.innerHTML = data.map(c => renderDiskRow(c, false)).join("");
+    childBox.innerHTML = renderDiskChildrenList(data);
     childBox.style.display = "block";
-    // Re-expand any descendants the user had opened.
+    // Re-expand any descendants the user previously had open.
     for (const p of [...expandedPaths]) {
       if (p === path || !p.startsWith(path + "/")) continue;
       const sub = childBox.querySelector(`.disk-row[data-path="${cssEsc(p)}"]`);
@@ -484,89 +570,169 @@ async function loadChildren(path, row, silent) {
   }
 }
 
-// Hashes whose <details> file list the user has manually opened. Snapshot
-// from the live DOM right before each re-render so polling doesn't snap
-// them shut. The toggle event doesn't bubble and details elements get
-// destroyed by innerHTML before any close event would fire, so we read
-// the open state directly from the DOM instead.
-const openHashes = new Set();
-function snapshotOpen() {
-  openHashes.clear();
-  document.querySelectorAll("details.files[open]").forEach(d => {
-    if (d.dataset.hash) openHashes.add(d.dataset.hash);
-  });
-}
+function cssEsc(s) { return s.replace(/(["\\])/g, "\\$1"); }
 
-async function render(jobs) {
+// ============================================================
+// Jobs section — in-place update
+// ============================================================
+//
+// Each job has a stable .job element keyed by data-hash. On each tick we
+// reorder (added_on desc), append new, remove gone, and update text/widths
+// in existing rows. The <details> file list is rebuilt only when its
+// member set changes.
+
+async function applyJobs(jobs) {
   const root = document.getElementById("jobs");
+  // Remove the empty-state placeholder if present.
+  const placeholder = root.querySelector(".empty");
+  if (placeholder) placeholder.remove();
+
   if (!jobs.length) {
-    root.innerHTML = '<div class="empty">no jobs yet · trigger a grab in Sonarr to see one appear</div>';
+    while (root.firstChild) root.firstChild.remove();
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "no jobs yet · trigger a grab in Sonarr to see one appear";
+    root.appendChild(empty);
     return;
   }
+
   jobs.sort((a, b) => b.added_on - a.added_on);
-  // Fetch file lists per job in parallel.
+  // Pull file lists in parallel (cheap; only used to populate the panel).
   const fileLists = await Promise.all(jobs.map(j =>
     fetch("/api/v2/torrents/files?hash=" + encodeURIComponent(j.hash))
       .then(r => r.json()).catch(() => [])
   ));
-  root.innerHTML = jobs.map((j, i) => {
-    const pct = (j.progress * 100).toFixed(1);
-    const fillClass = j.state === "pausedUP" ? "ok" : j.state === "error" ? "err" : "";
-    const errBlock = (j.state === "error" && j.error_message)
-      ? `<div class="err-msg">${esc(j.error_message)}</div>` : "";
-    const files = fileLists[i] || [];
-    const inProgress = j.state === "downloading" && curLabel ? curLabel : null;
+
+  // Index existing rows by hash.
+  const existing = new Map();
+  root.querySelectorAll(".job[data-hash]").forEach(el => existing.set(el.dataset.hash, el));
+
+  // Build/reuse rows in the new order.
+  const wanted = new Set();
+  for (let i = 0; i < jobs.length; i++) {
+    const j = jobs[i];
+    wanted.add(j.hash);
+    let el = existing.get(j.hash);
+    if (!el) {
+      el = buildJobRow(j);
+      root.appendChild(el);
+    } else if (el.nextSibling !== null && root.children[i] !== el) {
+      // Re-order: move to position i.
+      const at = root.children[i];
+      if (at !== el) root.insertBefore(el, at);
+    }
+    updateJobRow(el, j, fileLists[i] || []);
+  }
+
+  // Drop jobs that no longer exist.
+  for (const [hash, el] of existing.entries()) {
+    if (!wanted.has(hash)) el.remove();
+  }
+}
+
+function buildJobRow(j) {
+  const el = document.createElement("div");
+  el.className = "job";
+  el.dataset.hash = j.hash;
+  el.innerHTML = `
+    <div class="job-head">
+      <div class="job-name"></div>
+      <div class="actions">
+        <button class="btn js-retry" style="display:none">retry</button>
+        <span class="state"></span>
+      </div>
+    </div>
+    <div class="bar"><div class="bar-fill"></div></div>
+    <div class="sub" style="display:none">
+      <span>now: <strong class="js-cur"></strong> <span class="js-cur-meta"></span></span>
+      <span class="js-cur-pct"></span>
+    </div>
+    <div class="bar small js-cur-bar" style="display:none"><div class="bar-fill"></div></div>
+    <div class="detail">
+      <div><strong>eta</strong><span class="js-eta"></span></div>
+      <div><strong>added</strong><span class="js-added"></span></div>
+      <div><strong>downloaded</strong><span class="js-downloaded"></span></div>
+      <div><strong>category</strong><code class="js-cat"></code></div>
+      <div style="grid-column:1/-1"><strong>path</strong><code class="js-path"></code></div>
+    </div>
+    <div class="err-msg js-err" style="display:none"></div>
+    <details class="files js-files" style="display:none">
+      <summary class="js-files-summary"></summary>
+      <ul class="js-files-list"></ul>
+    </details>`;
+  return el;
+}
+
+function updateJobRow(el, j, files) {
+  el.querySelector(".job-name").textContent = j.name;
+
+  const pct = (j.progress * 100).toFixed(1);
+  const stateEl = el.querySelector(".state");
+  stateEl.className = "state " + j.state;
+  stateEl.textContent = `${j.state} · ${pct}%`;
+
+  const bar = el.querySelector(".bar > .bar-fill");
+  bar.className = "bar-fill " + (j.state === "pausedUP" ? "ok" : j.state === "error" ? "err" : "");
+  bar.style.width = pct + "%";
+
+  const completedUnits = j.completed_units ?? 0;
+  const expectedUnits = j.expected_units ?? 1;
+  const curLabel = j.current_unit_label || "";
+  const curPct = ((j.current_unit_progress || 0) * 100).toFixed(1);
+  const showSub = j.state === "downloading" && expectedUnits > 1 && curLabel;
+  const sub = el.querySelector(".sub");
+  const subBar = el.querySelector(".js-cur-bar");
+  if (showSub) {
+    sub.style.display = "";
+    subBar.style.display = "";
+    el.querySelector(".js-cur").textContent = curLabel;
+    el.querySelector(".js-cur-meta").textContent = `(${completedUnits}/${expectedUnits} done)`;
+    el.querySelector(".js-cur-pct").textContent = `${curPct}%`;
+    subBar.querySelector(".bar-fill").style.width = curPct + "%";
+  } else {
+    sub.style.display = "none";
+    subBar.style.display = "none";
+  }
+
+  el.querySelector(".js-eta").textContent = fmtETA(j.eta_seconds);
+  el.querySelector(".js-added").textContent = fmtAge(j.added_on);
+  el.querySelector(".js-downloaded").textContent = fmtBytes(j.downloaded);
+  el.querySelector(".js-cat").textContent = j.category || "—";
+  el.querySelector(".js-path").textContent = j.content_path;
+
+  const errEl = el.querySelector(".js-err");
+  if (j.state === "error" && j.error_message) {
+    errEl.textContent = j.error_message;
+    errEl.style.display = "";
+  } else {
+    errEl.style.display = "none";
+  }
+
+  const retryBtn = el.querySelector(".js-retry");
+  const canRetry = j.state === "error" || j.state === "pausedUP";
+  retryBtn.style.display = canRetry ? "" : "none";
+  retryBtn.dataset.hash = j.hash;
+  if (!retryBtn.disabled) retryBtn.textContent = "retry";
+
+  // Files panel: rebuild <ul> only if file set or in-progress label changed.
+  const filesEl = el.querySelector(".js-files");
+  const inProgress = j.state === "downloading" && curLabel ? curLabel : "";
+  const wantKey = files.map(f => f.name + ":" + f.size).join("|") + "##" + inProgress + ":" + curPct;
+  if (filesEl.dataset.key !== wantKey) {
+    filesEl.dataset.key = wantKey;
     const rows = files.map(f =>
       `<li><span class="file-name">${esc(f.name)}</span><span class="file-pct done">100%</span><span class="file-size">${fmtBytes(f.size)}</span></li>`
     );
     if (inProgress) {
       rows.push(`<li><span class="file-name">${esc(inProgress)} <em style="color:var(--muted);font-style:normal">· downloading</em></span><span class="file-pct">${curPct}%</span><span class="file-size">—</span></li>`);
     }
-    const fileBlock = rows.length ? `
-      <details class="files" data-hash="${esc(j.hash)}">
-        <summary>${files.length} done${inProgress ? ` · 1 in progress` : ""}${expectedUnits > files.length + (inProgress ? 1 : 0) ? ` · ${expectedUnits - files.length - (inProgress ? 1 : 0)} pending` : ""}</summary>
-        <ul>${rows.join("")}</ul>
-      </details>` : "";
-    const completedUnits = j.completed_units ?? 0;
-    const expectedUnits = j.expected_units ?? 1;
-    const curLabel = j.current_unit_label || "";
-    const curPct = ((j.current_unit_progress || 0) * 100).toFixed(1);
-    const showSub = j.state === "downloading" && expectedUnits > 1 && curLabel;
-    const subBlock = showSub ? `
-        <div class="sub"><span>now: <strong>${esc(curLabel)}</strong> &nbsp;(${completedUnits}/${expectedUnits} done)</span><span>${curPct}%</span></div>
-        <div class="bar small"><div class="bar-fill" style="width:${curPct}%"></div></div>
-      ` : "";
-    const eta = j.eta_seconds;
-    const canRetry = j.state === "error" || j.state === "pausedUP";
-    const retryBtn = canRetry
-      ? `<button class="btn" data-action="retry" data-hash="${esc(j.hash)}">retry</button>`
-      : "";
-    return `
-      <div class="job">
-        <div class="job-head">
-          <div class="job-name">${esc(j.name)}</div>
-          <div class="actions">
-            ${retryBtn}
-            <span class="state ${esc(j.state)}">${esc(j.state)} · ${pct}%</span>
-          </div>
-        </div>
-        <div class="bar"><div class="bar-fill ${fillClass}" style="width:${pct}%"></div></div>
-        ${subBlock}
-        <div class="detail">
-          <div><strong>eta</strong>${fmtETA(eta)}</div>
-          <div><strong>added</strong>${fmtAge(j.added_on)}</div>
-          <div><strong>downloaded</strong>${fmtBytes(j.downloaded)}</div>
-          <div><strong>category</strong><code>${esc(j.category || "—")}</code></div>
-          <div style="grid-column:1/-1"><strong>path</strong><code>${esc(j.content_path)}</code></div>
-        </div>
-        ${errBlock}
-        ${fileBlock}
-      </div>`;
-  }).join("");
-  // Restore <details> open state after the innerHTML rebuild.
-  root.querySelectorAll("details.files").forEach(d => {
-    if (openHashes.has(d.dataset.hash)) d.open = true;
-  });
+    el.querySelector(".js-files-list").innerHTML = rows.join("");
+    const pending = expectedUnits - files.length - (inProgress ? 1 : 0);
+    el.querySelector(".js-files-summary").textContent =
+      `${files.length} done${inProgress ? ` · 1 in progress` : ""}${pending > 0 ? ` · ${pending} pending` : ""}`;
+  }
+  if (files.length || inProgress) filesEl.style.display = "";
+  else filesEl.style.display = "none";
 }
 
 async function loadSettings() {
@@ -598,7 +764,7 @@ document.getElementById("save-settings").addEventListener("click", async () => {
 });
 
 document.addEventListener("click", async (e) => {
-  // Disk row toggle (click anywhere on a dir row except the delete button).
+  // Disk row toggle (anywhere on a dir row except buttons).
   const diskRow = e.target.closest(".disk-row.is-dir");
   if (diskRow && !e.target.closest("button")) {
     const path = diskRow.dataset.path;
@@ -617,30 +783,35 @@ document.addEventListener("click", async (e) => {
         body: JSON.stringify({name}),
       });
       if (!r.ok) throw new Error(await r.text());
-      tick();
+      tickDisk();
     } catch (err) {
       delBtn.textContent = "failed";
       setTimeout(() => { delBtn.disabled = false; delBtn.textContent = "delete"; }, 2000);
     }
     return;
   }
-  const btn = e.target.closest("button[data-action='retry']");
-  if (!btn) return;
-  const hash = btn.dataset.hash;
-  btn.disabled = true; btn.textContent = "retrying…";
-  try {
-    const r = await fetch("/jobs/" + encodeURIComponent(hash) + "/retry", { method: "POST" });
-    if (!r.ok) throw new Error("retry failed: " + r.status);
-    tick();
-  } catch (err) {
-    btn.textContent = "failed";
-    setTimeout(() => { btn.disabled = false; btn.textContent = "retry"; }, 2000);
+  const retryBtn = e.target.closest(".js-retry");
+  if (retryBtn) {
+    const hash = retryBtn.dataset.hash;
+    if (!hash) return;
+    retryBtn.disabled = true; retryBtn.textContent = "retrying…";
+    try {
+      const r = await fetch("/jobs/" + encodeURIComponent(hash) + "/retry", { method: "POST" });
+      if (!r.ok) throw new Error("retry failed: " + r.status);
+      retryBtn.disabled = false;
+      tickJobs();
+    } catch (err) {
+      retryBtn.textContent = "failed";
+      setTimeout(() => { retryBtn.disabled = false; retryBtn.textContent = "retry"; }, 2000);
+    }
   }
 });
 
 loadSettings();
-tick();
-setInterval(() => { loadSettings(); tick(); }, POLL_MS);
+tickJobs();
+tickDisk();
+setInterval(() => { loadSettings(); tickJobs(); }, POLL_MS_JOBS);
+setInterval(tickDisk, POLL_MS_DISK);
 </script>
 </body>
 </html>
