@@ -23,47 +23,84 @@ def retry_job(job_hash: str) -> dict:
 
 
 @router.get("/disk")
-def disk_listing() -> list[dict]:
-    """List immediate subdirectories of the download dir. For each, sum file
-    sizes and report whether a current job owns that path. Used by the
-    dashboard to surface orphaned download dirs."""
-    import os, shutil
+def disk_listing(path: str = "") -> list[dict]:
+    """List immediate children of <download_dir>/<path>. Each entry has:
+        type: "dir" | "file"
+        name: basename
+        path: download-dir-relative path (used for further drilling)
+        size: total bytes (dir totals are recursive)
+        files: file count (1 for files, recursive count for dirs)
+        partials: # of .part files inside (0 for non-dirs)
+        tracked: bool — only meaningful at top level
+        ours: bool — only meaningful at top level (name ends with .watchseries)
+
+    Top-level entries are sorted ours-first, then alphabetical; nested
+    entries are sorted dirs-first, then alphabetical."""
+    import os
     from pathlib import Path
     jm = fakeqbt._jobs
     if jm is None:
         raise HTTPException(status_code=503, detail="job manager not configured")
-    root = jm.default_save_path
-    tracked = {Path(j.content_path).name for j in jm.list()}
-    out = []
-    if not root.exists():
-        return out
-    for entry in sorted(root.iterdir()):
-        if not entry.is_dir() or entry.name.startswith("."):
+    root = jm.default_save_path.resolve()
+    target = (root / path).resolve() if path else root
+    # No traversal outside the download dir.
+    if root != target and root not in target.parents:
+        raise HTTPException(status_code=400, detail="path outside download dir")
+    if not target.exists() or not target.is_dir():
+        raise HTTPException(status_code=404, detail="no such directory")
+
+    is_top = (target == root)
+    tracked = {Path(j.content_path).name for j in jm.list()} if is_top else set()
+
+    out: list[dict] = []
+    for entry in sorted(target.iterdir()):
+        if entry.name.startswith(".") and is_top:
             continue
-        total = 0
-        files = 0
-        partials = 0
-        for dp, _, fns in os.walk(entry):
-            for fn in fns:
-                fp = Path(dp) / fn
-                try:
-                    total += fp.stat().st_size
-                except OSError:
-                    continue
-                files += 1
-                if fn.endswith(".part"):
-                    partials += 1
-        is_ours = entry.name.endswith(".watchseries")
-        out.append({
-            "name": entry.name,
-            "size": total,
-            "files": files,
-            "partials": partials,
-            "tracked": entry.name in tracked,
-            "ours": is_ours,
-        })
-    # Show our stuff first, then alphabetical.
-    out.sort(key=lambda r: (not r["ours"], r["name"].lower()))
+        rel = str(entry.relative_to(root))
+        if entry.is_dir():
+            total = 0
+            files = 0
+            partials = 0
+            for dp, _, fns in os.walk(entry):
+                for fn in fns:
+                    fp = Path(dp) / fn
+                    try:
+                        total += fp.stat().st_size
+                    except OSError:
+                        continue
+                    files += 1
+                    if fn.endswith(".part"):
+                        partials += 1
+            out.append({
+                "type": "dir",
+                "name": entry.name,
+                "path": rel,
+                "size": total,
+                "files": files,
+                "partials": partials,
+                "tracked": entry.name in tracked,
+                "ours": entry.name.endswith(".watchseries") if is_top else False,
+            })
+        else:
+            try:
+                size = entry.stat().st_size
+            except OSError:
+                size = 0
+            out.append({
+                "type": "file",
+                "name": entry.name,
+                "path": rel,
+                "size": size,
+                "files": 1,
+                "partials": 1 if entry.name.endswith(".part") else 0,
+                "tracked": False,
+                "ours": False,
+            })
+
+    if is_top:
+        out.sort(key=lambda r: (not r["ours"], r["name"].lower()))
+    else:
+        out.sort(key=lambda r: (r["type"] != "dir", r["name"].lower()))
     return out
 
 
@@ -217,6 +254,12 @@ _HTML = r"""<!doctype html>
     .disk-row.foreign { opacity: 0.55; }
     .disk-row.foreign .badge { background: var(--panel-2); color: var(--muted); }
     .disk-divider { margin: 10px 0 6px; padding-left: 4px; font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+    .disk-row.is-dir { cursor: pointer; }
+    .disk-row .chev { display: inline-block; width: 14px; color: var(--muted); transition: transform 0.15s; }
+    .disk-row.open .chev { transform: rotate(90deg); }
+    .disk-row.is-file { cursor: default; }
+    .disk-children { margin-left: 22px; margin-bottom: 6px; }
+    .disk-children .disk-row { padding: 6px 12px; font-size: 0.84rem; }
     .bar {
       position: relative; height: 8px; background: var(--panel-2);
       border-radius: 999px; overflow: hidden; margin: 8px 0 12px;
@@ -340,6 +383,14 @@ async function tick() {
   }
 }
 
+// Paths that the user has expanded; persist across polls so the tree
+// doesn't collapse during the 3s refresh.
+const expandedPaths = new Set();
+
+function snapshotExpanded() {
+  // No DOM read needed — expandedPaths is our single source of truth.
+}
+
 function renderDisk(rows) {
   const root = document.getElementById("disk");
   const summary = document.getElementById("disk-summary");
@@ -349,40 +400,88 @@ function renderDisk(rows) {
     return;
   }
   const totalBytes = rows.reduce((s, r) => s + (r.size || 0), 0);
-  const orphans = rows.filter(r => !r.tracked).length;
+  const orphans = rows.filter(r => r.type === "dir" && !r.tracked).length;
   summary.textContent = `${rows.length} dir${rows.length === 1 ? "" : "s"} · ${fmtBytes(totalBytes)} total · ${orphans} orphan${orphans === 1 ? "" : "s"}`;
   const ours = rows.filter(r => r.ours);
   const others = rows.filter(r => !r.ours);
-  const renderRow = r => {
-    const partials = r.partials > 0 ? ` <span style="color:var(--warn)">· ${r.partials} .part</span>` : "";
-    const badge = r.tracked
-      ? '<span class="badge tracked">tracked</span>'
-      : '<span class="badge orphan">orphan</span>';
-    const delBtn = r.tracked
-      ? '<span></span>'
-      : `<button class="btn" data-disk-delete="${esc(r.name)}">delete</button>`;
-    return `
-      <div class="disk-row ${r.ours ? "" : "foreign"}">
-        <div>
-          <div class="disk-name">${esc(r.name)}</div>
-          <div class="disk-meta">${r.files} file${r.files === 1 ? "" : "s"}${partials}</div>
-        </div>
-        <div class="disk-meta" style="text-align:right">${fmtBytes(r.size)}</div>
-        <div style="text-align:center">${badge}</div>
-        <div></div>
-        <div style="text-align:right">${delBtn}</div>
-      </div>`;
-  };
   let html = "";
   if (ours.length) {
     html += '<div class="disk-divider">from this service</div>';
-    html += ours.map(renderRow).join("");
+    html += ours.map(r => renderDiskRow(r, true)).join("");
   }
   if (others.length) {
     html += '<div class="disk-divider">other downloads (shared dir)</div>';
-    html += others.map(renderRow).join("");
+    html += others.map(r => renderDiskRow(r, true)).join("");
   }
   root.innerHTML = html;
+  // Re-expand anything the user had opened.
+  for (const p of [...expandedPaths]) {
+    const row = root.querySelector(`.disk-row[data-path="${cssEsc(p)}"]`);
+    if (row) loadChildren(p, row, /*silent*/true);
+  }
+}
+
+function renderDiskRow(r, topLevel) {
+  const isDir = r.type === "dir";
+  const partials = r.partials > 0 ? ` <span style="color:var(--warn)">· ${r.partials} .part</span>` : "";
+  const badge = topLevel
+    ? (r.tracked
+        ? '<span class="badge tracked">tracked</span>'
+        : (isDir ? '<span class="badge orphan">orphan</span>' : '<span></span>'))
+    : '<span></span>';
+  const delBtn = topLevel && !r.tracked && isDir
+    ? `<button class="btn" data-disk-delete="${esc(r.name)}">delete</button>`
+    : '<span></span>';
+  const chev = isDir ? '<span class="chev">▶</span>' : '<span class="chev">·</span>';
+  return `
+    <div class="disk-row ${r.ours ? "" : (topLevel ? "foreign" : "")} ${isDir ? "is-dir" : "is-file"}"
+         data-path="${esc(r.path)}" data-is-dir="${isDir}">
+      <div>
+        <div class="disk-name">${chev} ${esc(r.name)}</div>
+        <div class="disk-meta">${r.files} file${r.files === 1 ? "" : "s"}${partials}</div>
+      </div>
+      <div class="disk-meta" style="text-align:right">${fmtBytes(r.size)}</div>
+      <div style="text-align:center">${badge}</div>
+      <div></div>
+      <div style="text-align:right">${delBtn}</div>
+    </div>
+    <div class="disk-children" data-children-of="${esc(r.path)}" style="display:none"></div>`;
+}
+
+function cssEsc(s) {
+  return s.replace(/(["\\])/g, "\\$1");
+}
+
+async function loadChildren(path, row, silent) {
+  const childBox = row.nextElementSibling;
+  if (!childBox || !childBox.matches(".disk-children")) return;
+  if (!silent) {
+    if (row.classList.contains("open")) {
+      // collapse
+      row.classList.remove("open");
+      childBox.style.display = "none";
+      expandedPaths.delete(path);
+      return;
+    }
+    row.classList.add("open");
+    expandedPaths.add(path);
+  } else {
+    row.classList.add("open");
+  }
+  try {
+    const data = await fetch("/disk?path=" + encodeURIComponent(path)).then(r => r.json());
+    childBox.innerHTML = data.map(c => renderDiskRow(c, false)).join("");
+    childBox.style.display = "block";
+    // Re-expand any descendants the user had opened.
+    for (const p of [...expandedPaths]) {
+      if (p === path || !p.startsWith(path + "/")) continue;
+      const sub = childBox.querySelector(`.disk-row[data-path="${cssEsc(p)}"]`);
+      if (sub) loadChildren(p, sub, true);
+    }
+  } catch (e) {
+    childBox.innerHTML = '<div class="muted" style="padding:8px">failed to load</div>';
+    childBox.style.display = "block";
+  }
 }
 
 // Hashes whose <details> file list the user has manually opened. Snapshot
@@ -499,6 +598,13 @@ document.getElementById("save-settings").addEventListener("click", async () => {
 });
 
 document.addEventListener("click", async (e) => {
+  // Disk row toggle (click anywhere on a dir row except the delete button).
+  const diskRow = e.target.closest(".disk-row.is-dir");
+  if (diskRow && !e.target.closest("button")) {
+    const path = diskRow.dataset.path;
+    if (path) await loadChildren(path, diskRow, false);
+    return;
+  }
   const delBtn = e.target.closest("button[data-disk-delete]");
   if (delBtn) {
     const name = delBtn.dataset.diskDelete;
