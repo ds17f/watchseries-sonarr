@@ -14,6 +14,11 @@ from pathlib import Path
 from .jobs import Episode, Job
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
     hash TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -111,6 +116,19 @@ class JobStore:
                 files=[Path(p) for p in json.loads(r["files_json"] or "[]")],
             ))
         return out
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO settings (key, value) VALUES (?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (key, value))
 
     def close(self) -> None:
         with self._lock:

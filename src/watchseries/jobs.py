@@ -67,20 +67,66 @@ class Job:
         return self.save_path / safe_name(self.name)
 
 
+DEFAULT_MAX_PARALLEL = 2
+
+
 class JobManager:
     def __init__(self, default_save_path: Path, store=None):
         self.default_save_path = default_save_path
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
         self._store = store  # optional JobStore for persistence
+        # Concurrency cap: workers wait on this condition until they're under
+        # the limit. Changing max_parallel at runtime takes effect for
+        # queued jobs immediately; jobs already running continue.
+        self._active: set[str] = set()
+        self._slot_cv = threading.Condition()
+        self.max_parallel = DEFAULT_MAX_PARALLEL
+        if store is not None:
+            try:
+                self.max_parallel = int(store.get_setting(
+                    "max_parallel", str(DEFAULT_MAX_PARALLEL)))
+            except ValueError:
+                pass
         if store is not None:
             # Resume: load any persisted jobs, restart workers for ones that
             # were mid-flight before shutdown.
             for job in store.load_all():
                 self._jobs[job.hash] = job
                 if job.state in (STATE_QUEUED, STATE_DOWNLOADING):
+                    # Don't preserve the in-flight progress fraction across
+                    # restart — the ffmpeg process is gone.
+                    job.current_unit_progress = 0.0
+                    job.state = STATE_QUEUED
                     threading.Thread(target=self._run, args=(job,),
                                      daemon=True).start()
+
+    def set_max_parallel(self, n: int) -> int:
+        n = max(1, min(20, int(n)))
+        with self._slot_cv:
+            self.max_parallel = n
+            self._slot_cv.notify_all()
+        if self._store is not None:
+            try:
+                self._store.set_setting("max_parallel", str(n))
+            except Exception:
+                pass
+        return n
+
+    def _acquire_slot(self, job: Job) -> None:
+        """Block until a worker slot is free, then mark this job active."""
+        with self._slot_cv:
+            while len(self._active) >= self.max_parallel:
+                if job.state != STATE_QUEUED:
+                    job.state = STATE_QUEUED
+                    self._persist(job)
+                self._slot_cv.wait()
+            self._active.add(job.hash)
+
+    def _release_slot(self, job: Job) -> None:
+        with self._slot_cv:
+            self._active.discard(job.hash)
+            self._slot_cv.notify_all()
 
     # ---- public API ----
 
@@ -167,6 +213,8 @@ class JobManager:
 
     def _run(self, job: Job) -> None:
         missed: list[str] = []
+        # Wait for a slot if too many jobs are already running.
+        self._acquire_slot(job)
         try:
             job.state = STATE_DOWNLOADING
             job.error = ""
@@ -222,6 +270,8 @@ class JobManager:
             job.state = STATE_ERROR
             job.error = repr(e)
             self._persist(job)
+        finally:
+            self._release_slot(job)
 
     def _download_movie(self, job: Job) -> bool:
         dest = job.content_path / f"{safe_name(job.title)}.mp4"

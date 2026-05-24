@@ -5,6 +5,7 @@ each job as a card with a progress bar.
 """
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 
 from . import fakeqbt
 
@@ -19,6 +20,31 @@ def retry_job(job_hash: str) -> dict:
     if not jm.retry(job_hash.lower()):
         raise HTTPException(status_code=404, detail="no such job")
     return {"ok": True}
+
+
+@router.get("/settings")
+def get_settings() -> dict:
+    jm = fakeqbt._jobs
+    if jm is None:
+        raise HTTPException(status_code=503, detail="job manager not configured")
+    return {
+        "max_parallel": jm.max_parallel,
+        "active_jobs": len(jm._active),
+    }
+
+
+class SettingsUpdate(BaseModel):
+    max_parallel: int | None = None
+
+
+@router.put("/settings")
+def put_settings(body: SettingsUpdate) -> dict:
+    jm = fakeqbt._jobs
+    if jm is None:
+        raise HTTPException(status_code=503, detail="job manager not configured")
+    if body.max_parallel is not None:
+        jm.set_max_parallel(body.max_parallel)
+    return get_settings()
 
 _HTML = r"""<!doctype html>
 <html lang="en">
@@ -86,6 +112,19 @@ _HTML = r"""<!doctype html>
     }
     button.btn:hover { background: #2d3946; border-color: var(--accent); }
     button.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .settings {
+      display: flex; align-items: center; gap: 14px;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 12px; padding: 14px 18px; margin-bottom: 18px;
+      font-size: 0.9rem;
+    }
+    .settings label { color: var(--muted); }
+    .settings input[type="number"] {
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 4px 8px; width: 60px; font-family: inherit;
+    }
+    .settings .indicator { color: var(--muted); margin-left: auto; font-size: 0.82rem; }
     .bar {
       position: relative; height: 8px; background: var(--panel-2);
       border-radius: 999px; overflow: hidden; margin: 8px 0 12px;
@@ -142,6 +181,12 @@ _HTML = r"""<!doctype html>
     <div class="meta" id="meta">loading…</div>
   </header>
   <main>
+    <div class="settings">
+      <label for="max-parallel">max concurrent downloads</label>
+      <input type="number" id="max-parallel" min="1" max="20" step="1"/>
+      <button class="btn" id="save-settings">save</button>
+      <span class="indicator" id="settings-indicator"></span>
+    </div>
     <div id="jobs">
       <div class="empty">no jobs yet</div>
     </div>
@@ -279,6 +324,34 @@ async function render(jobs) {
   });
 }
 
+async function loadSettings() {
+  try {
+    const s = await fetch("/settings").then(r => r.json());
+    const inp = document.getElementById("max-parallel");
+    if (document.activeElement !== inp) inp.value = s.max_parallel;
+    document.getElementById("settings-indicator").textContent =
+      `${s.active_jobs} of ${s.max_parallel} slots in use`;
+  } catch (e) { /* ignore */ }
+}
+
+document.getElementById("save-settings").addEventListener("click", async () => {
+  const v = parseInt(document.getElementById("max-parallel").value, 10);
+  if (!Number.isFinite(v)) return;
+  const ind = document.getElementById("settings-indicator");
+  ind.textContent = "saving…";
+  try {
+    await fetch("/settings", {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({max_parallel: v}),
+    });
+    await loadSettings();
+    tick();
+  } catch (e) {
+    ind.textContent = "save failed";
+  }
+});
+
 document.addEventListener("click", async (e) => {
   const btn = e.target.closest("button[data-action='retry']");
   if (!btn) return;
@@ -294,8 +367,9 @@ document.addEventListener("click", async (e) => {
   }
 });
 
+loadSettings();
 tick();
-setInterval(tick, POLL_MS);
+setInterval(() => { loadSettings(); tick(); }, POLL_MS);
 </script>
 </body>
 </html>
