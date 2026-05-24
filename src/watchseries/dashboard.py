@@ -22,6 +22,70 @@ def retry_job(job_hash: str) -> dict:
     return {"ok": True}
 
 
+@router.get("/disk")
+def disk_listing() -> list[dict]:
+    """List immediate subdirectories of the download dir. For each, sum file
+    sizes and report whether a current job owns that path. Used by the
+    dashboard to surface orphaned download dirs."""
+    import os, shutil
+    from pathlib import Path
+    jm = fakeqbt._jobs
+    if jm is None:
+        raise HTTPException(status_code=503, detail="job manager not configured")
+    root = jm.default_save_path
+    tracked = {Path(j.content_path).name for j in jm.list()}
+    out = []
+    if not root.exists():
+        return out
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        total = 0
+        files = 0
+        partials = 0
+        for dp, _, fns in os.walk(entry):
+            for fn in fns:
+                fp = Path(dp) / fn
+                try:
+                    total += fp.stat().st_size
+                except OSError:
+                    continue
+                files += 1
+                if fn.endswith(".part"):
+                    partials += 1
+        out.append({
+            "name": entry.name,
+            "size": total,
+            "files": files,
+            "partials": partials,
+            "tracked": entry.name in tracked,
+        })
+    return out
+
+
+class DiskDelete(BaseModel):
+    name: str
+
+
+@router.post("/disk/delete")
+def disk_delete(body: DiskDelete) -> dict:
+    """Delete a directory under /downloads. Refuses if the directory is
+    currently tracked by an active job (delete the job first)."""
+    import shutil
+    jm = fakeqbt._jobs
+    if jm is None:
+        raise HTTPException(status_code=503, detail="job manager not configured")
+    root = jm.default_save_path
+    # Make sure the target is a direct child of root — no traversal.
+    target = (root / body.name).resolve()
+    if target.parent != root.resolve() or not target.exists():
+        raise HTTPException(status_code=404, detail="no such directory")
+    if body.name in {j.content_path.name for j in jm.list()}:
+        raise HTTPException(status_code=409, detail="directory is owned by an active job; delete the job first")
+    shutil.rmtree(target, ignore_errors=True)
+    return {"ok": True}
+
+
 @router.get("/settings")
 def get_settings() -> dict:
     jm = fakeqbt._jobs
@@ -125,6 +189,27 @@ _HTML = r"""<!doctype html>
       padding: 4px 8px; width: 60px; font-family: inherit;
     }
     .settings .indicator { color: var(--muted); margin-left: auto; font-size: 0.82rem; }
+    .section-h {
+      margin: 32px 0 12px; display: flex; align-items: baseline;
+      justify-content: space-between;
+    }
+    .section-h h2 { margin: 0; font-size: 1.05rem; font-weight: 600; }
+    .section-h .muted { color: var(--muted); font-size: 0.85rem; }
+    .disk-row {
+      display: grid; grid-template-columns: 1fr 80px 100px 110px 80px;
+      gap: 12px; align-items: center;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; padding: 10px 14px; margin-bottom: 6px;
+      font-size: 0.88rem;
+    }
+    .disk-row .disk-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+    .disk-row .disk-meta { color: var(--muted); font-size: 0.82rem; }
+    .disk-row .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 999px;
+      font-size: 0.72rem; text-align: center;
+    }
+    .disk-row .badge.tracked { background: rgba(88,166,255,0.15); color: var(--accent); }
+    .disk-row .badge.orphan { background: rgba(210,153,34,0.15); color: var(--warn); }
     .bar {
       position: relative; height: 8px; background: var(--panel-2);
       border-radius: 999px; overflow: hidden; margin: 8px 0 12px;
@@ -190,6 +275,13 @@ _HTML = r"""<!doctype html>
     <div id="jobs">
       <div class="empty">no jobs yet</div>
     </div>
+
+    <div class="section-h">
+      <h2>downloads on disk</h2>
+      <span class="muted" id="disk-summary"></span>
+    </div>
+    <div id="disk"></div>
+
     <div class="footer">
       polls every 3s · <a href="/torznab/api?t=caps" target="_blank">torznab caps</a> · <a href="/health" target="_blank">health</a>
     </div>
@@ -225,18 +317,53 @@ function esc(s) {
 async function tick() {
   snapshotOpen();
   try {
-    const [jobs, health] = await Promise.all([
+    const [jobs, health, disk] = await Promise.all([
       fetch("/api/v2/torrents/info").then(r => r.json()),
       fetch("/health").then(r => r.json()),
+      fetch("/disk").then(r => r.json()).catch(() => []),
     ]);
     document.getElementById("meta").textContent =
       jobs.length + " job" + (jobs.length === 1 ? "" : "s") +
       " · download dir: " + health.download_dir +
       (health.missing && health.missing.length ? " · MISSING: " + health.missing.join(",") : "");
     render(jobs);
+    renderDisk(disk);
   } catch (e) {
     document.getElementById("meta").textContent = "service unreachable";
   }
+}
+
+function renderDisk(rows) {
+  const root = document.getElementById("disk");
+  const summary = document.getElementById("disk-summary");
+  if (!rows.length) {
+    root.innerHTML = '<div class="muted">empty</div>';
+    summary.textContent = "";
+    return;
+  }
+  const totalBytes = rows.reduce((s, r) => s + (r.size || 0), 0);
+  const orphans = rows.filter(r => !r.tracked).length;
+  summary.textContent = `${rows.length} dir${rows.length === 1 ? "" : "s"} · ${fmtBytes(totalBytes)} total · ${orphans} orphan${orphans === 1 ? "" : "s"}`;
+  root.innerHTML = rows.map(r => {
+    const partials = r.partials > 0 ? ` <span style="color:var(--warn)">· ${r.partials} .part</span>` : "";
+    const badge = r.tracked
+      ? '<span class="badge tracked">tracked</span>'
+      : '<span class="badge orphan">orphan</span>';
+    const delBtn = r.tracked
+      ? '<span></span>'
+      : `<button class="btn" data-disk-delete="${esc(r.name)}">delete</button>`;
+    return `
+      <div class="disk-row">
+        <div>
+          <div class="disk-name">${esc(r.name)}</div>
+          <div class="disk-meta">${r.files} file${r.files === 1 ? "" : "s"}${partials}</div>
+        </div>
+        <div class="disk-meta" style="text-align:right">${fmtBytes(r.size)}</div>
+        <div style="text-align:center">${badge}</div>
+        <div></div>
+        <div style="text-align:right">${delBtn}</div>
+      </div>`;
+  }).join("");
 }
 
 // Hashes whose <details> file list the user has manually opened. Snapshot
@@ -353,6 +480,25 @@ document.getElementById("save-settings").addEventListener("click", async () => {
 });
 
 document.addEventListener("click", async (e) => {
+  const delBtn = e.target.closest("button[data-disk-delete]");
+  if (delBtn) {
+    const name = delBtn.dataset.diskDelete;
+    if (!confirm("Permanently delete " + name + " from /downloads?")) return;
+    delBtn.disabled = true; delBtn.textContent = "…";
+    try {
+      const r = await fetch("/disk/delete", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({name}),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      tick();
+    } catch (err) {
+      delBtn.textContent = "failed";
+      setTimeout(() => { delBtn.disabled = false; delBtn.textContent = "delete"; }, 2000);
+    }
+    return;
+  }
   const btn = e.target.closest("button[data-action='retry']");
   if (!btn) return;
   const hash = btn.dataset.hash;
