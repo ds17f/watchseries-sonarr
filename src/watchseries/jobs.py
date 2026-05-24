@@ -94,6 +94,22 @@ class JobManager:
     def get(self, h: str) -> Job | None:
         return self._jobs.get(h)
 
+    def retry(self, h: str) -> bool:
+        """Restart a job. Re-uses the existing record (so already-downloaded
+        files are kept and skipped) and respawns the worker thread."""
+        job = self._jobs.get(h)
+        if job is None:
+            return False
+        # Reset transient state, keep files list so resume works.
+        job.error = ""
+        job.state = STATE_QUEUED
+        job.progress = 0.0
+        job.current_unit_progress = 0.0
+        job.current_unit_label = ""
+        self._persist(job)
+        threading.Thread(target=self._run, args=(job,), daemon=True).start()
+        return True
+
     def delete(self, h: str) -> None:
         with self._lock:
             self._jobs.pop(h, None)

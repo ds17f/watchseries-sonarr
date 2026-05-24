@@ -3,10 +3,22 @@
 Served at `/`. Polls `/api/v2/torrents/info` every few seconds and renders
 each job as a card with a progress bar.
 """
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 
+from . import fakeqbt
+
 router = APIRouter()
+
+
+@router.post("/jobs/{job_hash}/retry", include_in_schema=False)
+def retry_job(job_hash: str) -> dict:
+    jm = fakeqbt._jobs
+    if jm is None:
+        raise HTTPException(status_code=503, detail="job manager not configured")
+    if not jm.retry(job_hash.lower()):
+        raise HTTPException(status_code=404, detail="no such job")
+    return {"ok": True}
 
 _HTML = r"""<!doctype html>
 <html lang="en">
@@ -65,6 +77,15 @@ _HTML = r"""<!doctype html>
     .state.pausedUP { background: rgba(63,185,80,0.15); color: var(--ok); }
     .state.error { background: rgba(248,81,73,0.15); color: var(--err); }
     .state.queuedDL { background: rgba(210,153,34,0.15); color: var(--warn); }
+    .actions { display: flex; gap: 8px; align-items: center; }
+    button.btn {
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 4px 12px; font-size: 0.8rem; cursor: pointer;
+      font-family: inherit;
+    }
+    button.btn:hover { background: #2d3946; border-color: var(--accent); }
+    button.btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .bar {
       position: relative; height: 8px; background: var(--panel-2);
       border-radius: 999px; overflow: hidden; margin: 8px 0 12px;
@@ -199,11 +220,18 @@ async function render(jobs) {
         <div class="bar small"><div class="bar-fill" style="width:${curPct}%"></div></div>
       ` : "";
     const eta = j.eta_seconds;
+    const canRetry = j.state === "error" || j.state === "pausedUP";
+    const retryBtn = canRetry
+      ? `<button class="btn" data-action="retry" data-hash="${esc(j.hash)}">retry</button>`
+      : "";
     return `
       <div class="job">
         <div class="job-head">
           <div class="job-name">${esc(j.name)}</div>
-          <span class="state ${esc(j.state)}">${esc(j.state)} · ${pct}%</span>
+          <div class="actions">
+            ${retryBtn}
+            <span class="state ${esc(j.state)}">${esc(j.state)} · ${pct}%</span>
+          </div>
         </div>
         <div class="bar"><div class="bar-fill ${fillClass}" style="width:${pct}%"></div></div>
         ${subBlock}
@@ -219,6 +247,21 @@ async function render(jobs) {
       </div>`;
   }).join("");
 }
+
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-action='retry']");
+  if (!btn) return;
+  const hash = btn.dataset.hash;
+  btn.disabled = true; btn.textContent = "retrying…";
+  try {
+    const r = await fetch("/jobs/" + encodeURIComponent(hash) + "/retry", { method: "POST" });
+    if (!r.ok) throw new Error("retry failed: " + r.status);
+    tick();
+  } catch (err) {
+    btn.textContent = "failed";
+    setTimeout(() => { btn.disabled = false; btn.textContent = "retry"; }, 2000);
+  }
+});
 
 tick();
 setInterval(tick, POLL_MS);
